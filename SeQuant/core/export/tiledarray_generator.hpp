@@ -148,14 +148,13 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
     // a default-constructed TA::TSpArrayD is a valid "not yet assigned"
     // placeholder until the first compute() gives it a real value via `=`.
   }
-  void load(const Tensor &tensor, bool set_to_zero, const Context &) override {
-    if (set_to_zero) {
-      throw Exception(
-          "TiledArrayGenerator: zero-initialized leaf load is not "
-          "supported in v1");
-    }
+  void load(const Tensor &, bool, const Context &) override {
     // Leaves ARE the function parameters (see file header) -- nothing to
-    // emit, the parameter name is already directly usable.
+    // emit, the parameter name is already directly usable. set_to_zero is
+    // ignored: a genuine external leaf's caller is responsible for
+    // providing the correct data (whether that's zero or not); there is
+    // no const-correct way to zero a `const TA::TSpArrayD&` parameter
+    // in-place anyway.
   }
   void set_to_zero(const Tensor &tensor, const Context &ctx) override {
     m_body += m_indent + represent(tensor, ctx) + " = TA::TSpArrayD();\n";
@@ -170,16 +169,13 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
   }
   void persist(const Tensor &tensor, const Context &ctx) override {
     m_result_name = represent(tensor, ctx);
+    m_result_is_tensor = true;
   }
 
   void create(const Variable &, bool, const Context &) override {}
-  void load(const Variable &variable, bool set_to_zero,
-            const Context &) override {
-    if (set_to_zero) {
-      throw Exception(
-          "TiledArrayGenerator: zero-initialized leaf load is not "
-          "supported in v1");
-    }
+  void load(const Variable &, bool, const Context &) override {
+    // See the Tensor overload's comment -- set_to_zero is ignored for the
+    // same reason.
   }
   void set_to_zero(const Variable &variable, const Context &ctx) override {
     m_body += m_indent + represent(variable, ctx) + " = 0.0;\n";
@@ -188,6 +184,7 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
   void destroy(const Variable &, const Context &) override {}
   void persist(const Variable &variable, const Context &ctx) override {
     m_result_name = represent(variable, ctx);
+    m_result_is_tensor = false;
   }
 
   void compute(const Expr &expression, const Tensor &result,
@@ -204,7 +201,7 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
     const std::string name = represent(result, ctx);
     const bool first_write = m_written.insert(name).second;
     m_body += m_indent + name + (first_write ? " = " : " += ") +
-              stringify_scalar(expression, ctx) + ";\n";
+              compute_scalar_rhs(expression, ctx) + ";\n";
   }
 
   void declare(const Index &, const Context &) override {
@@ -253,6 +250,7 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
     m_written.clear();
     m_leaf_names.clear();
     m_result_name.clear();
+    m_result_is_tensor = true;
   }
   void end_named_section(std::string_view, const Context &) override {
     m_generated += render_function() + "\n";
@@ -273,6 +271,7 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
   std::string m_indent = "  ";
   std::string m_current_name;
   std::string m_result_name;
+  bool m_result_is_tensor = true;
   std::vector<std::pair<std::string, std::string>> m_params;
   std::set<std::string> m_declared_names;
   std::set<std::string> m_leaf_names;
@@ -377,9 +376,14 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
 
     std::string tensor_expr;
     if (tensors.size() == 2) {
+      // TA::einsum(...) returns a concrete DistArray, not a TsrExpr -- it
+      // must be re-annotated before it can participate in a `+=`
+      // accumulation or a scalar-multiply expression (both require an
+      // actual tensor *expression*, not a bare array). Self-annotating
+      // with the SAME result_annotation immediately turns it into one.
       tensor_expr = "TA::einsum(" + annotated(*tensors[0], ctx) + ", " +
                     annotated(*tensors[1], ctx) + ", \"" + result_annotation +
-                    "\")";
+                    "\")(\"" + result_annotation + "\")";
     } else if (tensors.size() == 1) {
       tensor_expr = annotated(*tensors[0], ctx);
     } else if (tensors.empty()) {
@@ -409,9 +413,54 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
         expr.type_name());
   }
 
+  /// Like product_rhs, but for a Product whose result is a bare scalar
+  /// (Variable), e.g. a fully-contracted energy-like term with no free
+  /// indices remaining. TA has no "einsum with empty output" call --
+  /// TA::dot(A, B) is the real-valued full contraction that plays that
+  /// role (matching cck.ipp's own use of TA::dot for exactly this case).
+  std::string product_scalar_rhs(const Product &product,
+                                 const Context &ctx) const {
+    std::string scalar_text;
+    std::vector<const Tensor *> tensors;
+    collect_product_factors(product, scalar_text, tensors, ctx);
+
+    std::string tensor_expr;
+    if (tensors.size() == 2) {
+      tensor_expr =
+          "TA::dot(" + annotated(*tensors[0], ctx) + ", " +
+          annotated(*tensors[1], ctx) + ")";
+    } else if (tensors.size() == 1) {
+      // A single tensor fully reduced to a scalar (e.g. sum of all
+      // elements) -- not needed by any case exercised so far, but handled
+      // for completeness via TA's own reduction.
+      tensor_expr = annotated(*tensors[0], ctx) + ".sum()";
+    } else if (tensors.empty()) {
+      return scalar_text.empty() ? "0.0" : scalar_text;
+    } else {
+      throw Exception(
+          "TiledArrayGenerator: Product (scalar result) has " +
+          std::to_string(tensors.size()) +
+          " tensor factors -- expected at most 2");
+    }
+
+    if (scalar_text.empty()) return tensor_expr;
+    return "(" + tensor_expr + ") * " + scalar_text;
+  }
+
+  std::string compute_scalar_rhs(const Expr &expr, const Context &ctx) const {
+    if (expr.is<Variable>() || expr.is<Constant>() || expr.is<Power>())
+      return stringify_scalar(expr, ctx);
+    if (expr.is<Product>()) return product_scalar_rhs(expr.as<Product>(), ctx);
+    throw Exception(
+        "TiledArrayGenerator: unsupported compute() (scalar result) "
+        "expression type " +
+        expr.type_name());
+  }
+
   std::string render_function() const {
     std::ostringstream oss;
-    oss << "TA::TSpArrayD " << m_current_name << "(";
+    oss << (m_result_is_tensor ? "TA::TSpArrayD " : "double ")
+        << m_current_name << "(";
     for (std::size_t i = 0; i < m_params.size(); ++i) {
       if (i > 0) oss << ", ";
       oss << m_params[i].first << " " << m_params[i].second;
