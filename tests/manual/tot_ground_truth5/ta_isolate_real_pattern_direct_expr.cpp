@@ -27,7 +27,15 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  TA::TSpArrayD g = build_sparse_array(world, g_coo, {1, 4}, "g");
+  // NOTE: must match build_tot_array's own adaptive_tile_sizes() choice for
+  // the "x" dimension (extent 4, target_tiles_per_dim=8 -> tile size 1, i.e.
+  // 4 separate tiles), not an arbitrarily-chosen tile size -- a genuine
+  // TiledRange1 mismatch between g and C on the shared/contracted dimension
+  // is what TA::einsum's debug-mode congruence check (cont_engine.h) caught
+  // (see below); a Release build has this check compiled out (#ifndef
+  // NDEBUG) and silently proceeds instead, which is the real reason this
+  // looked like an internal TA crash rather than an ordinary setup bug.
+  TA::TSpArrayD g = build_sparse_array(world, g_coo, {1, 1}, "g");
   ArrayToT C = build_tot_array<ArrayToT>(world, c_coo, /*outer_rank=*/2,
                                         /*inner_rank=*/1, /*pair_key_rank=*/1,
                                         "C");
