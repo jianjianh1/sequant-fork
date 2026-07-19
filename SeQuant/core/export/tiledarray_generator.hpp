@@ -257,6 +257,20 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
     if (m_leaf_names.count(name)) return;  // never release a parameter
     const std::string type = tensor_cpp_type(tensor);
     m_body += m_indent + name + " = " + type + "();  // release\n";
+    // BUG FIX (2026-07-19, Phase 5 real-data crash investigation,
+    // twinkly-dazzling-shamir.md task #21): a released C++ variable slot
+    // can be REUSED for a later, semantically unrelated intermediate (same
+    // name, fresh default-constructed value) -- but m_written (which
+    // decides "=" vs "+=" in compute()) is scoped to the whole export, not
+    // to a variable's current lifetime, so without this erase the reused
+    // slot's first write after release wrongly emits "+=" onto a
+    // default-constructed (no World/TiledRange bound) array. TA
+    // dereferences that array's internal state to perform the
+    // accumulation and segfaults (confirmed: real ethane-data T1 residual
+    // crashed exactly here, at "I2_i_μ̃(...) += ..." right after "I2_i_μ̃ =
+    // TA::TSpArrayD();  // release" with no intervening "="). Erasing here
+    // makes the next compute() on this name see it as a fresh first-write.
+    m_written.erase(name);
   }
   void destroy(const Tensor &tensor, const Context &ctx) override {
     unload(tensor, ctx);
@@ -437,16 +451,41 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
     return false;
   }
 
+  // CANONICALIZATION (2026-07-19, Phase 5 real-data crash investigation,
+  // twinkly-dazzling-shamir.md task #21): a single-pass classification that
+  // appends to `outer` in tensor.const_indices() ORDER produces a
+  // DIFFERENT outer-axis order depending on where in that argument list a
+  // proto-indexed index happens to sit -- e.g. a rank-1-proto "C" tensor
+  // written as C^{a}_{i,\mu} (proto-carrying index first) classifies as
+  // outer=[i,mu], but the SAME logical leaf written as C_{\mu}^{a}_{i} in
+  // a different equation term (proto-carrying index last) classifies as
+  // outer=[mu,i] -- REVERSED. Both occurrences get bound, by Phase 4's
+  // adapter, to the SAME physical array (loaded once with one fixed axis
+  // order) -- confirmed empirically to be exactly what caused BOTH the T1
+  // and T2 real-ethane-data crashes ("the contracted/fused dimensions...
+  // are not congruent"): the reversed-order occurrence's generated
+  // annotation labels the physically-9-wide "i" axis as "mu" (elsewhere
+  // 114-wide), so TA rejects the mismatched extent under that shared
+  // label. Fix: canonicalize so proto-index-derived ("pair key") outer
+  // indices ALWAYS precede directly-appearing outer indices, regardless of
+  // this tensor occurrence's own argument order -- matching Phase 4's own
+  // loader convention (pair-key columns first). This makes every
+  // occurrence of a given logical ToT leaf, however SeQuant happened to
+  // order its arguments for that term, agree on one fixed outer order.
   IndexClass classify_indices(const Tensor &tensor) const {
     IndexClass result;
     for (const Index &idx : tensor.const_indices()) {
-      if (!idx.has_proto_indices()) {
-        if (!contains_index(result.outer, idx)) result.outer.push_back(idx);
-      } else {
+      if (idx.has_proto_indices()) {
         for (const Index &proto : idx.proto_indices()) {
           if (!contains_index(result.outer, proto))
             result.outer.push_back(proto);
         }
+      }
+    }
+    for (const Index &idx : tensor.const_indices()) {
+      if (!idx.has_proto_indices()) {
+        if (!contains_index(result.outer, idx)) result.outer.push_back(idx);
+      } else {
         result.inner.push_back(idx.drop_proto_indices());
       }
     }
