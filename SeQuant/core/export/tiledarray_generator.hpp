@@ -530,6 +530,38 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
     IndexClass cb = classify_indices(b);
     if (!ca.is_tot && !cb.is_tot) return ContractionMode::Plain;
 
+    // CONFIRMED REAL CRASH (2026-07-18, Phase 3 numeric ground-truth
+    // testing, twinkly-dazzling-shamir.md): a plain (non-DeNest)
+    // TA::einsum(flat_operand, ToT_operand, ann) call -- exactly what
+    // product_rhs emits by default whenever only ONE of the two operands
+    // is ToT -- segfaults inside TiledArray::Einsum::einsum<DeNest::False>
+    // when the flat operand shares an OUTER index directly with the ToT
+    // operand (reproduced standalone: g(i,x) * C(i,x;a') -> R(i;a'), i
+    // shared+surviving, x shared+contracted; gdb backtrace confirms the
+    // crash is inside TA's own DeNest::False einsum internals, not this
+    // generator's annotation). This is not a rare corner case: 40/120 (R1)
+    // and 115/399 (R2) of the plain-einsum calls in the real T1/T2
+    // residuals have exactly this shape. Until TiledArray's own bug is
+    // root-caused/fixed or a safe alternative call pattern is found, refuse
+    // to emit it -- matches this generator's standing principle (see
+    // EMPIRICALLY_UNSAFE_CATALOG note above) of throwing rather than
+    // silently emitting code known to crash on real data.
+    if (ca.is_tot != cb.is_tot) {
+      const IndexClass &tot_side = ca.is_tot ? ca : cb;
+      const IndexClass &flat_side = ca.is_tot ? cb : ca;
+      for (const Index &idx : flat_side.outer) {
+        if (contains_index(tot_side.outer, idx)) {
+          throw Exception(
+              "TiledArrayGenerator: a flat operand sharing an outer index "
+              "directly with a ToT operand, contracted via plain (non-"
+              "DeNest) TA::einsum, is a confirmed TiledArray-internal crash "
+              "(segfault in Einsum::einsum<DeNest::False>) -- refusing to "
+              "emit; see Phase 3 ground-truth testing notes in "
+              "twinkly-dazzling-shamir.md");
+        }
+      }
+    }
+
     std::string result_inner_part;
     auto semi = result_annotation.find(';');
     if (semi != std::string::npos)

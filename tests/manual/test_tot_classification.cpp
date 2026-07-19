@@ -120,27 +120,33 @@ int main() {
     if (!err.empty()) std::cerr << "    (exception: " << err << ")\n";
   }
 
-  // --- Case 2: flat x ToT -> ToT (PNO load / Hadamard pass-through) -------
+  // --- Case 2: flat x ToT sharing an outer index -- must throw -----------
+  // CONFIRMED REAL CRASH (Phase 3 ground-truth numeric testing,
+  // 2026-07-18): a plain (non-DeNest) TA::einsum(flat, ToT, ann) call
+  // segfaults inside TiledArray::Einsum::einsum<DeNest::False> whenever the
+  // flat operand shares an outer index directly with the ToT operand --
+  // reproduced standalone (g(i,x)*C(i,x;a')->R(i;a'), gdb-confirmed crash
+  // site) AND confirmed to occur 40/120 (R1) + 115/399 (R2) times in the
+  // real T1/T2 residual generated code. This was ORIGINALLY this test's
+  // "must succeed" case before that finding -- now correctly asserts the
+  // throw check_tot_contraction_safety() added in response.
   {
-    std::cerr << "=== Case 2: flat x ToT -> ToT (Hadamard pass-through) ===\n";
+    std::cerr << "=== Case 2: flat x ToT sharing an outer index (must throw "
+                 "-- confirmed TA crash) ===\n";
     Index i1(occ, 1);
     Index x1(virt, 1);  // flat CSV-basis dummy
     Index a1p(virt, 2, container::vector<Index>{i1});  // proto by i1
-    // g_flat(i1,x1) * C(a1p,x1) -> R(i1,a1p): x1 contracted at outer level,
-    // a1p survives (Hadamard-through the PNO axis) -- a legitimate ToT op.
     auto g = ex<Tensor>(L"g", bra{i1}, ket{x1});
     auto C = ex<Tensor>(L"C", bra{a1p}, ket{x1});
     auto prod = ex<Product>(Product{1, {g, C}});
     auto [code, err] = try_export(prod);
-    expect(err.empty(), "no exception for flat x ToT Hadamard pass-through");
-    if (err.empty()) {
-      expect(code.find("DistArray<TA::Tensor<TA::Tensor<double>>") !=
-                std::string::npos,
-            "generated ArrayToT-typed result code");
-      expect(code.find(';') != std::string::npos,
-            "ToT annotation contains ';' outer/inner separator");
+    expect(!err.empty(), "throws for flat x ToT sharing an outer index");
+    if (!err.empty()) {
+      std::cerr << "    (exception, expected: " << err << ")\n";
     } else {
-      std::cerr << "    (exception: " << err << ")\n";
+      std::cerr << "    (no exception -- unexpectedly succeeded; generated "
+                    "code:\n"
+                << code << ")\n";
     }
   }
 
