@@ -530,18 +530,50 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
     IndexClass cb = classify_indices(b);
     if (!ca.is_tot && !cb.is_tot) return ContractionMode::Plain;
 
-    // CONFIRMED REAL CRASH (2026-07-18, Phase 3 numeric ground-truth
+    std::string result_outer_part = result_annotation;
+    std::string result_inner_part;
+    {
+      auto semi = result_annotation.find(';');
+      if (semi != std::string::npos) {
+        result_outer_part = result_annotation.substr(0, semi);
+        result_inner_part = result_annotation.substr(semi + 1);
+      }
+    }
+
+    auto token_survives = [](const std::string &part, const Index &idx) {
+      // classify_indices() gives us label()-equivalent copies, so a plain
+      // string containment check against the comma-separated part is a
+      // correct (if crude) membership test.
+      std::string tok = sanitize_identifier(toUtf8(idx.label()));
+      std::string field;
+      std::istringstream iss(part);
+      while (std::getline(iss, field, ',')) {
+        if (field == tok) return true;
+      }
+      return false;
+    };
+    auto inner_survives = [&](const Index &idx) {
+      return token_survives(result_inner_part, idx);
+    };
+
+    // CONFIRMED REAL CRASH (2026-07-18/19, Phase 3 numeric ground-truth
     // testing, twinkly-dazzling-shamir.md): a plain (non-DeNest)
     // TA::einsum(flat_operand, ToT_operand, ann) call -- exactly what
     // product_rhs emits by default whenever only ONE of the two operands
     // is ToT -- segfaults inside TiledArray::Einsum::einsum<DeNest::False>
-    // when the flat operand shares an OUTER index directly with the ToT
-    // operand (reproduced standalone: g(i,x) * C(i,x;a') -> R(i;a'), i
-    // shared+surviving, x shared+contracted; gdb backtrace confirms the
-    // crash is inside TA's own DeNest::False einsum internals, not this
-    // generator's annotation). This is not a rare corner case: 40/120 (R1)
-    // and 115/399 (R2) of the plain-einsum calls in the real T1/T2
-    // residuals have exactly this shape. Until TiledArray's own bug is
+    // whenever a shared OUTER index between the two operands is
+    // CONTRACTED (absent from the result). Isolated via two standalone
+    // reproductions: (1) mixed Hadamard+contraction, g(i,x)*C(i,x;a')->
+    // R(i;a'), i shared+surviving AND x shared+contracted -- crashes; (2)
+    // PURE contraction with no Hadamard-shared index at all, g(x)*
+    // C(i,x;a')->R(i;a') (i only ever appears in C, not shared with g) --
+    // ALSO crashes. A PURE Hadamard case with NO contraction at all,
+    // g(i)*C(i;a')->R(i;a'), does NOT crash and matches ground truth
+    // exactly -- so the trigger is specifically "some shared outer index
+    // gets contracted", not merely "an outer index is shared". This is not
+    // a rare corner case: 40/120 (R1) and 115/399 (R2) of the plain-einsum
+    // calls in the real T1/T2 residuals have a contracted shared outer
+    // index between a flat and ToT operand. Until TiledArray's own bug is
     // root-caused/fixed or a safe alternative call pattern is found, refuse
     // to emit it -- matches this generator's standing principle (see
     // EMPIRICALLY_UNSAFE_CATALOG note above) of throwing rather than
@@ -550,36 +582,18 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
       const IndexClass &tot_side = ca.is_tot ? ca : cb;
       const IndexClass &flat_side = ca.is_tot ? cb : ca;
       for (const Index &idx : flat_side.outer) {
-        if (contains_index(tot_side.outer, idx)) {
+        if (contains_index(tot_side.outer, idx) &&
+            !token_survives(result_outer_part, idx)) {
           throw Exception(
-              "TiledArrayGenerator: a flat operand sharing an outer index "
-              "directly with a ToT operand, contracted via plain (non-"
-              "DeNest) TA::einsum, is a confirmed TiledArray-internal crash "
+              "TiledArrayGenerator: a flat operand contracting a shared "
+              "outer index against a ToT operand via plain (non-DeNest) "
+              "TA::einsum is a confirmed TiledArray-internal crash "
               "(segfault in Einsum::einsum<DeNest::False>) -- refusing to "
               "emit; see Phase 3 ground-truth testing notes in "
               "twinkly-dazzling-shamir.md");
         }
       }
     }
-
-    std::string result_inner_part;
-    auto semi = result_annotation.find(';');
-    if (semi != std::string::npos)
-      result_inner_part = result_annotation.substr(semi + 1);
-
-    auto inner_survives = [&](const Index &idx) {
-      // classify_indices() gives us drop_proto_indices() copies whose
-      // label() equals what represent()/index_annotation() emits, so a
-      // plain string containment check against the comma-separated inner
-      // part is a correct (if crude) membership test.
-      std::string tok = sanitize_identifier(toUtf8(idx.label()));
-      std::string field;
-      std::istringstream iss(result_inner_part);
-      while (std::getline(iss, field, ',')) {
-        if (field == tok) return true;
-      }
-      return false;
-    };
 
     std::vector<Index> shared;
     for (const Index &ia : ca.inner)
