@@ -241,8 +241,10 @@ int main() {
     auto tree = to_export_tree(e, /*retain_braket=*/false);
     TiledArrayGenerator generator;
     TiledArrayGeneratorContext ctx;
+    std::string fn_name = "whole_t" + std::to_string(r) + "_residual";
     try {
-      export_expression(std::move(tree), generator, ctx);
+      export_group(ExpressionGroup<ExportExpr>{std::move(tree), fn_name},
+                  generator, ctx);
       std::string code = generator.get_generated_code();
       std::cout << "Generated " << code.size() << " chars of C++.\n";
       std::string path =
@@ -252,6 +254,8 @@ int main() {
              "einsum.h>\n#include <cmath>\n\n"
           << code;
       std::cout << "wrote " << path << "\n";
+      std::cout << "=== Leaf manifest (R" << r << ") ===\n"
+                << generator.leaf_manifest_report();
     } catch (const std::exception &ex) {
       std::cout << "EXCEPTION: " << ex.what() << "\n";
     }

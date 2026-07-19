@@ -79,6 +79,44 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
   TiledArrayGenerator() = default;
   ~TiledArrayGenerator() override = default;
 
+  /// Phase 4 (twinkly-dazzling-shamir.md): one entry per distinct terminal
+  /// (Usage::Terminal, i.e. function-parameter) leaf tensor encountered
+  /// during export, recorded in first-declared order. Lets a caller hand-map
+  /// each generated parameter to the right TATensors field (same (label,
+  /// family-signature) keying convention as gen_ta_trace_equations.py's
+  /// LEAF_FLAT_FIELD/LEAF_TOT_FIELD) without re-deriving it from the
+  /// generated C++ text.
+  struct LeafInfo {
+    std::string name;          ///< generated C++ parameter identifier
+    std::string label;         ///< raw tensor label (e.g. "C", "t", "f")
+    std::vector<std::string> outer_families;  ///< outer indices' space keys
+    std::vector<std::string> inner_families;  ///< inner (dropped-proto) keys
+    bool is_tot = false;
+  };
+
+  const std::vector<LeafInfo> &leaf_manifest() const { return m_leaf_manifest; }
+
+  /// Human-readable dump of leaf_manifest(), one line per leaf, e.g.
+  /// "C_ap1_a  label=C  outer=[a]  inner=[a]  ToT" -- for a one-off print
+  /// when hand-mapping parameters to TATensors fields.
+  std::string leaf_manifest_report() const {
+    std::ostringstream oss;
+    for (const LeafInfo &leaf : m_leaf_manifest) {
+      oss << leaf.name << "  label=" << leaf.label << "  outer=[";
+      for (std::size_t i = 0; i < leaf.outer_families.size(); ++i) {
+        if (i) oss << ",";
+        oss << leaf.outer_families[i];
+      }
+      oss << "]  inner=[";
+      for (std::size_t i = 0; i < leaf.inner_families.size(); ++i) {
+        if (i) oss << ",";
+        oss << leaf.inner_families[i];
+      }
+      oss << "]" << (leaf.is_tot ? "  ToT" : "  flat") << "\n";
+    }
+    return oss.str();
+  }
+
   std::string get_format_name() const override { return "TiledArray (C++)"; }
 
   bool supports_named_sections() const override { return true; }
@@ -109,6 +147,25 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
     return sanitize_identifier(toUtf8(idx.label()));
   }
 
+  /// Appends a LeafInfo for `tensor` under `name` to m_leaf_manifest, unless
+  /// that name is already recorded (declare() and the represent(Tensor)
+  /// lazy-declare fallback can both reach this for the same leaf).
+  void record_leaf_manifest(const Tensor &tensor,
+                            const std::string &name) const {
+    for (const LeafInfo &existing : m_leaf_manifest)
+      if (existing.name == name) return;
+    IndexClass cls = classify_indices(tensor);
+    LeafInfo info;
+    info.name = name;
+    info.label = toUtf8(tensor.label());
+    info.is_tot = cls.is_tot;
+    for (const Index &idx : cls.outer)
+      info.outer_families.push_back(toUtf8(idx.space().base_key()));
+    for (const Index &idx : cls.inner)
+      info.inner_families.push_back(toUtf8(idx.space().base_key()));
+    m_leaf_manifest.push_back(std::move(info));
+  }
+
   std::string represent(const Tensor &tensor,
                         const Context &) const override {
     const std::string name = tensor_var_name(tensor);
@@ -137,6 +194,7 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
       const std::string type = tensor_cpp_type(tensor);
       m_params.emplace_back("const " + type + "&", name);
       m_leaf_names.insert(name);
+      record_leaf_manifest(tensor, name);
     }
     return name;
   }
@@ -263,6 +321,7 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
     if (usage == Usage::Terminal) {
       m_params.emplace_back("const " + type + "&", name);
       m_leaf_names.insert(name);
+      record_leaf_manifest(tensor, name);
     } else {
       m_local_decls += m_indent + type + " " + name + ";\n";
     }
@@ -298,7 +357,10 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
   void begin_expression(const Context &) override {}
   void end_expression(const Context &) override {}
 
-  void begin_export(const Context &) override { m_generated.clear(); }
+  void begin_export(const Context &) override {
+    m_generated.clear();
+    m_leaf_manifest.clear();
+  }
   void end_export(const Context &) override {}
 
   std::string get_generated_code() const override { return m_generated; }
@@ -317,6 +379,7 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
   mutable std::set<std::string> m_leaf_names;
   std::set<std::string> m_written;
   mutable std::unordered_map<std::string, std::string> m_tensor_names;
+  mutable std::vector<LeafInfo> m_leaf_manifest;
 
   static double to_double(const sequant::rational &r) {
     return static_cast<double>(numerator(r)) /
