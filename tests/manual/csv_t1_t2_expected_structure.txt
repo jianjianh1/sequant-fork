@@ -1,0 +1,32 @@
+Expected structure of the closed-shell CSV/PNO CCSD T1/T2 residuals after
+the FULL cck.ipp-matching pipeline (make_cceqvec_csv_closedshell + second
+tail_factor + density_fit + csv_transform + flatten/optimize), as produced
+by test_csv_ccsd_derivation.cpp. Regenerate and diff against this whenever
+SeQuant/MPQC's derivation pipeline changes, to catch a silent structural
+drift before it surfaces as a confusing failure downstream.
+
+=== Residual R1 (T1) ===
+Type: sequant::Sum, 26 summands
+Invariant (only C/t carry proto_indices): HOLDS
+Structural summary (label(index-family-sig) x count):
+  C([1-proto],flat) x26
+  C(flat,[1-proto]) x28
+  C(flat,[2-proto]) x28
+  f(flat,flat) x6
+  g(flat,flat,flat) x40
+  s(flat,flat) x18
+  t([1-proto],flat) x28
+  t([2-proto],[2-proto],flat,flat) x14
+
+=== Residual R2 (T2) ===
+Type: sequant::Sum, 55 summands
+Invariant (only C/t carry proto_indices): HOLDS
+Structural summary (label(index-family-sig) x count):
+  C([2-proto],flat) x102
+  C(flat,[1-proto]) x56
+  C(flat,[2-proto]) x104
+  f(flat,flat) x4
+  g(flat,flat,flat) x102
+  s(flat,flat) x78
+  t([1-proto],flat) x56
+  t([2-proto],[2-proto],flat,flat) x56

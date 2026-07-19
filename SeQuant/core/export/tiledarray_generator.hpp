@@ -99,12 +99,46 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
   }
 
   std::string represent(const Index &idx, const Context &) const override {
-    return sanitize_identifier(toUtf8(idx.full_label()));
+    // Plain label() (NOT full_label()): full_label() embeds the
+    // proto-index list as "<...>" text for proto-indexed (PNO/CSV-
+    // restricted) indices, which would mangle into a meaningless token
+    // after sanitize_identifier. The restriction relationship is instead
+    // conveyed structurally by index_annotation()'s outer;inner split (see
+    // classify_indices()) -- represent() only ever needs the bare index
+    // identity here.
+    return sanitize_identifier(toUtf8(idx.label()));
   }
 
   std::string represent(const Tensor &tensor,
                         const Context &) const override {
-    return tensor_var_name(tensor);
+    const std::string name = tensor_var_name(tensor);
+    // The export framework's own declaration pass deduplicates tensors via
+    // TensorBlockLessThanComparator (core/utility/tensor.hpp), which
+    // compares (label, num_slots, num_indices, per-slot IndexSpace) --
+    // deliberately NOT proto-indices, since most backends don't need that
+    // distinction. But two ToT leaves sharing a label AND per-slot space
+    // (e.g. a virtual index restricted to a single-occupied-index PNO
+    // domain vs. an occupied-PAIR PNO domain -- osv vs. pno-proper, both
+    // just "the virtual space" as far as IndexSpace equality is concerned)
+    // are physically DIFFERENT arrays; tensor_var_name()'s proto-rank
+    // tagging (see its own comment) distinguishes them, but that means the
+    // framework's declare() pass calls back for only ONE representative
+    // per block-equivalence-class, silently skipping the other variant(s)
+    // -- confirmed empirically: a real CSV-CCSD T1 residual referenced a
+    // "C" variant in compute() whose declare() call never fired. Lazily
+    // declaring here on first reference is the fix: declare() already
+    // guards on m_declared_names, so this is a no-op whenever declare()
+    // legitimately got there first. Defaults newly-discovered tensors to
+    // Terminal (a function parameter) -- every case seen so far (C, t) is
+    // always a genuine external leaf, never a separately-computed
+    // intermediate; revisit if a lazily-declared tensor ever turns out to
+    // need Usage::Intermediate semantics instead.
+    if (m_declared_names.insert(name).second) {
+      const std::string type = tensor_cpp_type(tensor);
+      m_params.emplace_back("const " + type + "&", name);
+      m_leaf_names.insert(name);
+    }
+    return name;
   }
 
   std::string represent(const Variable &variable,
@@ -157,12 +191,14 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
     // in-place anyway.
   }
   void set_to_zero(const Tensor &tensor, const Context &ctx) override {
-    m_body += m_indent + represent(tensor, ctx) + " = TA::TSpArrayD();\n";
+    const std::string type = tensor_cpp_type(tensor);
+    m_body += m_indent + represent(tensor, ctx) + " = " + type + "();\n";
   }
   void unload(const Tensor &tensor, const Context &ctx) override {
     const std::string name = represent(tensor, ctx);
     if (m_leaf_names.count(name)) return;  // never release a parameter
-    m_body += m_indent + name + " = TA::TSpArrayD();  // release\n";
+    const std::string type = tensor_cpp_type(tensor);
+    m_body += m_indent + name + " = " + type + "();  // release\n";
   }
   void destroy(const Tensor &tensor, const Context &ctx) override {
     unload(tensor, ctx);
@@ -170,6 +206,7 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
   void persist(const Tensor &tensor, const Context &ctx) override {
     m_result_name = represent(tensor, ctx);
     m_result_is_tensor = true;
+    m_result_is_tot = is_tot_tensor(tensor);
   }
 
   void create(const Variable &, bool, const Context &) override {}
@@ -222,11 +259,12 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
   void declare(const Tensor &tensor, UsageSet usage, const Context &) override {
     const std::string name = tensor_var_name(tensor);
     if (!m_declared_names.insert(name).second) return;
+    const std::string type = tensor_cpp_type(tensor);
     if (usage == Usage::Terminal) {
-      m_params.emplace_back("const TA::TSpArrayD&", name);
+      m_params.emplace_back("const " + type + "&", name);
       m_leaf_names.insert(name);
     } else {
-      m_local_decls += m_indent + "TA::TSpArrayD " + name + ";\n";
+      m_local_decls += m_indent + type + " " + name + ";\n";
     }
   }
 
@@ -251,6 +289,7 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
     m_leaf_names.clear();
     m_result_name.clear();
     m_result_is_tensor = true;
+    m_result_is_tot = false;
   }
   void end_named_section(std::string_view, const Context &) override {
     m_generated += render_function() + "\n";
@@ -272,9 +311,10 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
   std::string m_current_name;
   std::string m_result_name;
   bool m_result_is_tensor = true;
-  std::vector<std::pair<std::string, std::string>> m_params;
-  std::set<std::string> m_declared_names;
-  std::set<std::string> m_leaf_names;
+  bool m_result_is_tot = false;
+  mutable std::vector<std::pair<std::string, std::string>> m_params;
+  mutable std::set<std::string> m_declared_names;
+  mutable std::set<std::string> m_leaf_names;
   std::set<std::string> m_written;
   mutable std::unordered_map<std::string, std::string> m_tensor_names;
 
@@ -296,11 +336,16 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
   /// Distinguishes different "blocks" of a tensor sharing the same label
   /// (e.g. an occ-occ vs. an occ-virtual slice of a conceptually single
   /// tensor) by appending each index's space to the label -- same idea as
-  /// PythonEinsumGeneratorBase::tensor_name's index-space tagging.
+  /// PythonEinsumGeneratorBase::tensor_name's index-space tagging. Also
+  /// tags each proto-indexed axis with its proto-index count ("p1"/"p2")
+  /// so e.g. a rank-1-PNO-restricted C and a rank-2-PNO-restricted C don't
+  /// collide on the same generated variable/parameter name.
   std::string tensor_var_name(const Tensor &tensor) const {
     std::string key = toUtf8(tensor.label());
     for (const Index &idx : tensor.const_indices()) {
       key += "_" + toUtf8(idx.space().base_key());
+      if (idx.has_proto_indices())
+        key += "p" + std::to_string(idx.proto_indices().size());
     }
     auto it = m_tensor_names.find(key);
     if (it != m_tensor_names.end()) return it->second;
@@ -309,15 +354,82 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
     return name;
   }
 
-  std::string index_annotation(const Tensor &tensor, const Context &ctx) const {
+  /// Outer (free/contractable, no proto-indices of their own -- plus any
+  /// proto-index a ToT axis is restricted by) vs. inner (the per-proto-
+  /// group PNO/CSV axis itself, proto-info stripped via drop_proto_indices)
+  /// index classification for a single Tensor. This is SeQuant's native
+  /// equivalent of Phase 1's DSL <i1,i2> pairarg bracket classification --
+  /// no external label table needed, since has_proto_indices()/
+  /// proto_indices() already carry the full restriction structure on every
+  /// Index natively.
+  struct IndexClass {
+    std::vector<Index> outer;
+    std::vector<Index> inner;
+    bool is_tot = false;
+  };
+
+  static bool contains_index(const std::vector<Index> &v, const Index &idx) {
+    for (const Index &x : v)
+      if (x == idx) return true;
+    return false;
+  }
+
+  IndexClass classify_indices(const Tensor &tensor) const {
+    IndexClass result;
+    for (const Index &idx : tensor.const_indices()) {
+      if (!idx.has_proto_indices()) {
+        if (!contains_index(result.outer, idx)) result.outer.push_back(idx);
+      } else {
+        for (const Index &proto : idx.proto_indices()) {
+          if (!contains_index(result.outer, proto))
+            result.outer.push_back(proto);
+        }
+        result.inner.push_back(idx.drop_proto_indices());
+      }
+    }
+    result.is_tot = !result.inner.empty();
+    return result;
+  }
+
+  static bool is_tot_tensor(const Tensor &tensor) {
+    for (const Index &idx : tensor.const_indices())
+      if (idx.has_proto_indices()) return true;
+    return false;
+  }
+
+  /// The tensor-of-tensor (PNO/CSV-restricted) array type, spelled out in
+  /// full rather than relying on an externally-defined "ArrayToT" alias
+  /// (e.g. ta_tensors.h's), so a generated function is compilable given
+  /// only <tiledarray.h> -- matching this generator's "self-contained
+  /// function" design (see file header).
+  static constexpr const char *kArrayToTType =
+      "TA::DistArray<TA::Tensor<TA::Tensor<double>>, TA::SparsePolicy>";
+
+  static std::string tensor_cpp_type(const Tensor &tensor) {
+    return is_tot_tensor(tensor) ? kArrayToTType : "TA::TSpArrayD";
+  }
+
+  std::string join_index_labels(const std::vector<Index> &indices,
+                                const Context &ctx) const {
     std::string s;
     bool first = true;
-    for (const Index &idx : tensor.const_indices()) {
+    for (const Index &idx : indices) {
       if (!first) s += ",";
       s += represent(idx, ctx);
       first = false;
     }
     return s;
+  }
+
+  /// Flat tensors get the usual comma-joined annotation. ToT tensors get
+  /// TA's own "outer;inner" ToT annotation convention (matching Phase 1's
+  /// gen_ta_trace_equations.py, which established this convention against
+  /// real TiledArray ToT usage already).
+  std::string index_annotation(const Tensor &tensor, const Context &ctx) const {
+    IndexClass cls = classify_indices(tensor);
+    std::string outer_s = join_index_labels(cls.outer, ctx);
+    if (!cls.is_tot) return outer_s;
+    return outer_s + ";" + join_index_labels(cls.inner, ctx);
   }
 
   std::string annotated(const Tensor &tensor, const Context &ctx) const {
@@ -367,6 +479,116 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
     }
   }
 
+  /// Whether a 2-tensor ToT product needs a plain TA::einsum call, or the
+  /// explicit de-nesting form.
+  enum class ContractionMode { Plain, DeNest };
+
+  /// Guards against ToT contraction patterns that don't correspond to a
+  /// single valid TA::einsum call, and identifies the one that does but
+  /// needs the explicit de-nesting template argument. TA::einsum's ToT
+  /// support treats a shared inner (PNO/CSV) index between the two operands
+  /// as EITHER a Hadamard (elementwise-preserved, survives into the result)
+  /// OR a contracted (summed away) axis -- never both within the same call,
+  /// and never partially (mixed Hadamard+contraction --
+  /// gen_ta_trace_equations.py classify_equation()'s `hadamard and
+  /// contracted` check, line ~165) -- that combination is genuinely
+  /// unsupported and throws below.
+  ///
+  /// A ToT x ToT product whose shared inner indices are ALL contracted away
+  /// AND whose result is itself flat (non-ToT) is a DIFFERENT, and valid,
+  /// case: full de-nesting. Confirmed by direct inspection (not guessed):
+  /// SeQuant's own existing TiledArray eval backend
+  /// (core/eval/backends/tiledarray/result.hpp:~619-624) dispatches exactly
+  /// this case ("ToT * ToT -> T", `node.left()->tot() && node.right()->tot()
+  /// && !node->tot()`) to `TA::einsum<TA::DeNest::True>(A, B, result_ann)`
+  /// with a result annotation carrying NO ';' -- and TiledArray's own test
+  /// suite (tests/dot_inner.cpp, tests/einsum.cpp) exercises exactly this
+  /// call shape. This is the real, supported PNO/CSV-to-flat back-transform
+  /// pattern that MPQC's own equations hit on essentially every PNO-
+  /// touching term (confirmed against the Phase 0/1 T1/T2 fixture) -- NOT
+  /// the separate, still-unresolved EMPIRICALLY_UNSAFE_CATALOG
+  /// (eq62/63/74/75) data-dependent crash gen_ta_trace_equations.py
+  /// isolated, which this check does not attempt to reproduce (no
+  /// structural signature distinguishes those four terms from the many
+  /// others that work).
+  ///
+  /// A shared inner identity being cleanly contracted (not partially) is
+  /// NOT by itself special -- if one operand also carries a SEPARATE,
+  /// unshared inner axis that survives untouched into the result (e.g. t's
+  /// OTHER PNO index passing through while its shared one contracts
+  /// against C), the result stays genuinely ToT and an ordinary (non-
+  /// de-nest) TA::einsum call handles it correctly; only when the shared
+  /// contraction drains the result's inner dimension to nothing (a
+  /// genuinely flat/non-ToT result) is the explicit de-nest dispatch
+  /// needed -- confirmed against the real Phase 0/1 T1/T2 fixture, which
+  /// exercises both this ordinary partial-contraction case and the full
+  /// de-nest case.
+  ContractionMode check_tot_contraction_safety(
+      const Tensor &a, const Tensor &b,
+      const std::string &result_annotation) const {
+    IndexClass ca = classify_indices(a);
+    IndexClass cb = classify_indices(b);
+    if (!ca.is_tot && !cb.is_tot) return ContractionMode::Plain;
+
+    std::string result_inner_part;
+    auto semi = result_annotation.find(';');
+    if (semi != std::string::npos)
+      result_inner_part = result_annotation.substr(semi + 1);
+
+    auto inner_survives = [&](const Index &idx) {
+      // classify_indices() gives us drop_proto_indices() copies whose
+      // label() equals what represent()/index_annotation() emits, so a
+      // plain string containment check against the comma-separated inner
+      // part is a correct (if crude) membership test.
+      std::string tok = sanitize_identifier(toUtf8(idx.label()));
+      std::string field;
+      std::istringstream iss(result_inner_part);
+      while (std::getline(iss, field, ',')) {
+        if (field == tok) return true;
+      }
+      return false;
+    };
+
+    std::vector<Index> shared;
+    for (const Index &ia : ca.inner)
+      for (const Index &ib : cb.inner)
+        if (ia == ib && !contains_index(shared, ia)) {
+          shared.push_back(ia);
+          break;
+        }
+    if (shared.empty()) return ContractionMode::Plain;
+
+    bool any_survive = false;
+    bool any_contracted = false;
+    for (const Index &idx : shared) {
+      if (inner_survives(idx))
+        any_survive = true;
+      else
+        any_contracted = true;
+    }
+    if (any_survive && any_contracted) {
+      throw Exception(
+          "TiledArrayGenerator: mixed Hadamard+contraction over ToT inner "
+          "(PNO/CSV) indices in a single product is not expressible as one "
+          "TA::einsum call");
+    }
+    // any_contracted here means every shared identity is cleanly contracted
+    // (the mixed case above already threw) -- this is an ordinary
+    // TA::einsum ToT contraction UNLESS it also drains the result's
+    // combined inner dimension to nothing, which is the special de-nest
+    // case (the result TYPE itself changes from ArrayToT to TA::TSpArrayD,
+    // requiring the explicit TA::einsum<DeNest::True> entry point). An
+    // unshared inner index surviving from just one operand (e.g. t's OTHER
+    // PNO axis passing through untouched while the SHARED one contracts
+    // against C) is completely ordinary and needs no special dispatch --
+    // by this point shared is nonempty, so ca.is_tot/cb.is_tot are already
+    // both guaranteed true.
+    if (any_contracted && result_inner_part.empty()) {
+      return ContractionMode::DeNest;
+    }
+    return ContractionMode::Plain;
+  }
+
   std::string product_rhs(const Product &product,
                           const std::string &result_annotation,
                           const Context &ctx) const {
@@ -376,12 +598,17 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
 
     std::string tensor_expr;
     if (tensors.size() == 2) {
+      ContractionMode mode = check_tot_contraction_safety(
+          *tensors[0], *tensors[1], result_annotation);
+      const std::string einsum_call =
+          mode == ContractionMode::DeNest ? "TA::einsum<TA::DeNest::True>"
+                                          : "TA::einsum";
       // TA::einsum(...) returns a concrete DistArray, not a TsrExpr -- it
       // must be re-annotated before it can participate in a `+=`
       // accumulation or a scalar-multiply expression (both require an
       // actual tensor *expression*, not a bare array). Self-annotating
       // with the SAME result_annotation immediately turns it into one.
-      tensor_expr = "TA::einsum(" + annotated(*tensors[0], ctx) + ", " +
+      tensor_expr = einsum_call + "(" + annotated(*tensors[0], ctx) + ", " +
                     annotated(*tensors[1], ctx) + ", \"" + result_annotation +
                     "\")(\"" + result_annotation + "\")";
     } else if (tensors.size() == 1) {
@@ -426,13 +653,38 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
 
     std::string tensor_expr;
     if (tensors.size() == 2) {
+      // TA::dot(...) is only ever used in MPQC's real cck.ipp on flat
+      // (non-ToT) arrays -- confirmed by direct inspection, no call site
+      // there passes an ArrayToT to it. Its semantics for a nested
+      // (PNO/CSV) tile type are therefore unverified in practice, so
+      // rather than guess (and risk silently emitting a call that either
+      // fails to compile or -- worse -- compiles but contracts the inner
+      // dimension incorrectly), refuse to emit it here. Phase 3's
+      // from-scratch numpy ground truth + small compiled probes are where
+      // the correct ToT full-contraction call pattern gets pinned down
+      // and this is upgraded from a throw to real code.
+      if (is_tot_tensor(*tensors[0]) || is_tot_tensor(*tensors[1])) {
+        throw Exception(
+            "TiledArrayGenerator: fully-contracted (scalar-result) product "
+            "of ToT (PNO/CSV-restricted) tensors is not yet supported -- "
+            "TA::dot's semantics for nested (ArrayToT) tiles are unverified "
+            "(MPQC's own cck.ipp never calls it on ArrayToT); see Phase 3 "
+            "of twinkly-dazzling-shamir.md");
+      }
       tensor_expr =
           "TA::dot(" + annotated(*tensors[0], ctx) + ", " +
           annotated(*tensors[1], ctx) + ")";
     } else if (tensors.size() == 1) {
       // A single tensor fully reduced to a scalar (e.g. sum of all
       // elements) -- not needed by any case exercised so far, but handled
-      // for completeness via TA's own reduction.
+      // for completeness via TA's own reduction. Same ToT caveat as the
+      // two-tensor TA::dot case above applies to .sum() on a nested tile.
+      if (is_tot_tensor(*tensors[0])) {
+        throw Exception(
+            "TiledArrayGenerator: fully-contracted (scalar-result) "
+            "reduction of a single ToT (PNO/CSV-restricted) tensor is not "
+            "yet supported -- see Phase 3 of twinkly-dazzling-shamir.md");
+      }
       tensor_expr = annotated(*tensors[0], ctx) + ".sum()";
     } else if (tensors.empty()) {
       return scalar_text.empty() ? "0.0" : scalar_text;
@@ -459,8 +711,10 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
 
   std::string render_function() const {
     std::ostringstream oss;
-    oss << (m_result_is_tensor ? "TA::TSpArrayD " : "double ")
-        << m_current_name << "(";
+    std::string result_type =
+        !m_result_is_tensor ? "double"
+                            : (m_result_is_tot ? kArrayToTType : "TA::TSpArrayD");
+    oss << result_type << " " << m_current_name << "(";
     for (std::size_t i = 0; i < m_params.size(); ++i) {
       if (i > 0) oss << ", ";
       oss << m_params[i].first << " " << m_params[i].second;
