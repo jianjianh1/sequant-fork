@@ -556,44 +556,23 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
       return token_survives(result_inner_part, idx);
     };
 
-    // CONFIRMED REAL CRASH (2026-07-18/19, Phase 3 numeric ground-truth
-    // testing, twinkly-dazzling-shamir.md): a plain (non-DeNest)
-    // TA::einsum(flat_operand, ToT_operand, ann) call -- exactly what
-    // product_rhs emits by default whenever only ONE of the two operands
-    // is ToT -- segfaults inside TiledArray::Einsum::einsum<DeNest::False>
-    // whenever a shared OUTER index between the two operands is
-    // CONTRACTED (absent from the result). Isolated via two standalone
-    // reproductions: (1) mixed Hadamard+contraction, g(i,x)*C(i,x;a')->
-    // R(i;a'), i shared+surviving AND x shared+contracted -- crashes; (2)
-    // PURE contraction with no Hadamard-shared index at all, g(x)*
-    // C(i,x;a')->R(i;a') (i only ever appears in C, not shared with g) --
-    // ALSO crashes. A PURE Hadamard case with NO contraction at all,
-    // g(i)*C(i;a')->R(i;a'), does NOT crash and matches ground truth
-    // exactly -- so the trigger is specifically "some shared outer index
-    // gets contracted", not merely "an outer index is shared". This is not
-    // a rare corner case: 40/120 (R1) and 115/399 (R2) of the plain-einsum
-    // calls in the real T1/T2 residuals have a contracted shared outer
-    // index between a flat and ToT operand. Until TiledArray's own bug is
-    // root-caused/fixed or a safe alternative call pattern is found, refuse
-    // to emit it -- matches this generator's standing principle (see
-    // EMPIRICALLY_UNSAFE_CATALOG note above) of throwing rather than
-    // silently emitting code known to crash on real data.
-    if (ca.is_tot != cb.is_tot) {
-      const IndexClass &tot_side = ca.is_tot ? ca : cb;
-      const IndexClass &flat_side = ca.is_tot ? cb : ca;
-      for (const Index &idx : flat_side.outer) {
-        if (contains_index(tot_side.outer, idx) &&
-            !token_survives(result_outer_part, idx)) {
-          throw Exception(
-              "TiledArrayGenerator: a flat operand contracting a shared "
-              "outer index against a ToT operand via plain (non-DeNest) "
-              "TA::einsum is a confirmed TiledArray-internal crash "
-              "(segfault in Einsum::einsum<DeNest::False>) -- refusing to "
-              "emit; see Phase 3 ground-truth testing notes in "
-              "twinkly-dazzling-shamir.md");
-        }
-      }
-    }
+    // RESOLVED (2026-07-18/19, Phase 3 ground-truth testing +
+    // twinkly-dazzling-shamir.md task #19/#20): a plain (non-DeNest)
+    // TA::einsum(flat_operand, ToT_operand, ann) call -- what product_rhs
+    // emits whenever only ONE operand is ToT -- used to segfault inside
+    // TiledArray::Einsum::einsum<DeNest::False> whenever a shared OUTER
+    // index between the two operands was CONTRACTED (absent from the
+    // result); not a rare case (40/120 and 115/399 of the plain-einsum
+    // calls in the real T1/T2 residuals have this shape). Root-caused to a
+    // genuine bug in TiledArray commit 7f76cda0 (this generator's original
+    // target version) -- confirmed fixed in commit 84411a6 (built,
+    // installed, and verified against real ethane leaf data with no
+    // crash, matching ground truth) via a from-scratch repro run on BOTH
+    // versions with identical, correctly-tiled input. This backend
+    // therefore now REQUIRES TiledArray >= 84411a6 (ta-bench's
+    // CMakeLists.txt TA_INSTALL_DIR was updated accordingly) -- no static
+    // check needed here anymore; leaving this comment as the record of
+    // why (a previous version of this method threw on this pattern).
 
     std::vector<Index> shared;
     for (const Index &ia : ca.inner)

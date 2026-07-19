@@ -120,19 +120,20 @@ int main() {
     if (!err.empty()) std::cerr << "    (exception: " << err << ")\n";
   }
 
-  // --- Case 2: flat x ToT sharing an outer index -- must throw -----------
-  // CONFIRMED REAL CRASH (Phase 3 ground-truth numeric testing,
-  // 2026-07-18): a plain (non-DeNest) TA::einsum(flat, ToT, ann) call
-  // segfaults inside TiledArray::Einsum::einsum<DeNest::False> whenever the
-  // flat operand shares an outer index directly with the ToT operand --
-  // reproduced standalone (g(i,x)*C(i,x;a')->R(i;a'), gdb-confirmed crash
-  // site) AND confirmed to occur 40/120 (R1) + 115/399 (R2) times in the
-  // real T1/T2 residual generated code. This was ORIGINALLY this test's
-  // "must succeed" case before that finding -- now correctly asserts the
-  // throw check_tot_contraction_safety() added in response.
+  // --- Case 2: flat x ToT, shared outer index contracted (Hadamard) ------
+  // RESOLVED (Phase 3 ground-truth numeric testing, 2026-07-18/19): a
+  // plain (non-DeNest) TA::einsum(flat, ToT, ann) call used to segfault
+  // inside TiledArray::Einsum::einsum<DeNest::False> whenever the flat
+  // operand shared an outer index directly with the ToT operand
+  // (reproduced standalone, g(i,x)*C(i,x;a')->R(i;a'), gdb-confirmed crash
+  // site; occurred 40/120 (R1) + 115/399 (R2) times in the real T1/T2
+  // residual generated code) -- root-caused to a genuine bug in
+  // TiledArray commit 7f76cda0, confirmed FIXED in commit 84411a6 (see
+  // task #19/#20 in twinkly-dazzling-shamir.md). This generator now
+  // requires TiledArray >= 84411a6 and no longer throws on this pattern.
   {
-    std::cerr << "=== Case 2: flat x ToT sharing an outer index (must throw "
-                 "-- confirmed TA crash) ===\n";
+    std::cerr << "=== Case 2: flat x ToT sharing an outer index (requires "
+                 "TiledArray >= 84411a6) ===\n";
     Index i1(occ, 1);
     Index x1(virt, 1);  // flat CSV-basis dummy
     Index a1p(virt, 2, container::vector<Index>{i1});  // proto by i1
@@ -140,13 +141,15 @@ int main() {
     auto C = ex<Tensor>(L"C", bra{a1p}, ket{x1});
     auto prod = ex<Product>(Product{1, {g, C}});
     auto [code, err] = try_export(prod);
-    expect(!err.empty(), "throws for flat x ToT sharing an outer index");
-    if (!err.empty()) {
-      std::cerr << "    (exception, expected: " << err << ")\n";
+    expect(err.empty(), "no exception for flat x ToT sharing an outer index");
+    if (err.empty()) {
+      expect(code.find("DistArray<TA::Tensor<TA::Tensor<double>>") !=
+                std::string::npos,
+            "generated ArrayToT-typed result code");
+      expect(code.find(';') != std::string::npos,
+            "ToT annotation contains ';' outer/inner separator");
     } else {
-      std::cerr << "    (no exception -- unexpectedly succeeded; generated "
-                    "code:\n"
-                << code << ")\n";
+      std::cerr << "    (unexpected exception: " << err << ")\n";
     }
   }
 
