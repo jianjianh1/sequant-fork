@@ -550,7 +550,29 @@ EvalExprNode binarize(Product const& prod, IndexSet const& uncontract,
         for (auto&& [k, v] : counts) {
           if (v.nonproto() == 0) continue;
           if (v.total() > 1) {
-            if (uncontracted_idxs.contains(k)) result.aux.emplace_back(k);
+            // `uncontracted_idxs` comes from
+            // left_to_right_binarization_indices(), which only ever compares
+            // *this* node's two direct operand subtrees against each other
+            // (see indices.hpp) -- it has no visibility into occurrences of
+            // `k` that live in other, not-yet-combined branches elsewhere in
+            // the overall binarization tree. That local view is exact for a
+            // standard Wick-contraction dummy, which by construction occurs
+            // in EXACTLY 2 tensor-index slots total (one contraction line):
+            // once both have been seen, it truly is fully resolved and must
+            // vanish. An index occurring MORE than twice (v.total() > 2)
+            // cannot be such a dummy at all; it is necessarily a persistent,
+            // non-summed "domain tag" shared by several factors (e.g. the
+            // CSV/PNO occupied-pair index tagging multiple C-transform
+            // tensors and the T amplitude). Such an index must survive this
+            // combination regardless of what the local, two-branch view of
+            // `uncontracted_idxs` concluded -- otherwise it is silently
+            // treated as contracted here even though further, not-yet-
+            // combined occurrences (or the term's own external result) still
+            // need it. See left_to_right_binarization_indices()'s "only
+            // exactly-2-occurrence dummies fully resolve" contract, which
+            // this restores for the >2 case.
+            if (v.total() > 2 || uncontracted_idxs.contains(k))
+              result.aux.emplace_back(k);
             continue;
           }
           auto& group = v.bra ? result.bra : v.ket ? result.ket : result.aux;
@@ -562,6 +584,15 @@ EvalExprNode binarize(Product const& prod, IndexSet const& uncontract,
       auto tn = TensorNetwork(ts);
       auto named_indices = tn.ext_indices();
       for (auto&& ix : uncontracted_idxs) named_indices.emplace(ix);
+      // Keep named_indices consistent with target_indices above (which may
+      // now retain indices, via the v.total() > 2 rule, that
+      // uncontracted_idxs alone would have dropped) -- canonicalize_slots()
+      // must treat exactly the same indices as "named"/external as the ones
+      // the result tensor is actually built with just below, or the
+      // resulting annotation and the tensor's own slot layout disagree.
+      for (auto&& ix : target_indices.bra) named_indices.emplace(ix);
+      for (auto&& ix : target_indices.ket) named_indices.emplace(ix);
+      for (auto&& ix : target_indices.aux) named_indices.emplace(ix);
 
       auto canon = tn.canonicalize_slots(
           TensorCanonicalizer::cardinal_tensor_labels(), &named_indices);
