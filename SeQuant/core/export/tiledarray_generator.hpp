@@ -51,6 +51,7 @@
 #include <SeQuant/core/utility/string.hpp>
 
 #include <cctype>
+#include <cwctype>
 #include <functional>
 #include <iomanip>
 #include <set>
@@ -185,16 +186,50 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
     // "C" variant in compute() whose declare() call never fired. Lazily
     // declaring here on first reference is the fix: declare() already
     // guards on m_declared_names, so this is a no-op whenever declare()
-    // legitimately got there first. Defaults newly-discovered tensors to
-    // Terminal (a function parameter) -- every case seen so far (C, t) is
-    // always a genuine external leaf, never a separately-computed
-    // intermediate; revisit if a lazily-declared tensor ever turns out to
-    // need Usage::Intermediate semantics instead.
+    // legitimately got there first.
+    //
+    // BUG FIX (2026-07-19, whole-residual real-data validation after the
+    // left_to_right_binarization_indices() domain-tag fix in indices.hpp /
+    // eval_expr.cpp): the comment above used to default EVERY
+    // lazily-discovered tensor to Usage::Terminal (a function parameter),
+    // reasoning that "every case seen so far (C, t) is always a genuine
+    // external leaf, never a separately-computed intermediate" -- but that
+    // was an empirical observation about which block-equivalence-class
+    // collisions happened to occur in practice, not a real invariant, and
+    // it explicitly flagged itself for revisiting. Correctly preserving a
+    // 3+-occurrence domain-tag index through more binarization steps (see
+    // indices.hpp) means more distinct sequant-core-synthesized
+    // intermediates -- always labeled "I" (tensor) / "Z" (scalar), see
+    // eval/eval_expr.cpp's detail::label_tensor/label_scalar; NEVER a
+    // genuine external leaf, by construction those are only ever produced
+    // by binarize()'s own make_prod/make_sum -- now collide into the same
+    // TensorBlockLessThanComparator class more often, so declare() skips
+    // more of them and they land here. Silently treating a SKIPPED "I"
+    // intermediate as Terminal instead of Intermediate previously went
+    // unnoticed only because it rarely happened to fire; now that it does,
+    // it manifests as a hard compile error (assigning into a `const&`
+    // parameter) -- confirming this was never actually safe. Fixed:
+    // dispatch on the tensor's own label, matching the sole distinguishing
+    // signal declare()'s real Usage value would have used. Strip trailing
+    // digits first: export.cpp's rename() (invoked by preprocess() to
+    // resolve a same-name-still-in-use collision between two DIFFERENT
+    // synthesized intermediates) turns "I" into "I2", "I3", ... -- still
+    // the same synthesized-intermediate family, just disambiguated.
+    bool const is_synthesized_intermediate = [&tensor]() {
+      std::wstring_view label = tensor.label();
+      std::size_t size = label.size();
+      while (size > 0 && std::iswdigit(label[size - 1])) --size;
+      return label.substr(0, size) == L"I";
+    }();
     if (m_declared_names.insert(name).second) {
       const std::string type = tensor_cpp_type(tensor);
-      m_params.emplace_back("const " + type + "&", name);
-      m_leaf_names.insert(name);
-      record_leaf_manifest(tensor, name);
+      if (is_synthesized_intermediate) {
+        m_local_decls += m_indent + type + " " + name + ";\n";
+      } else {
+        m_params.emplace_back("const " + type + "&", name);
+        m_leaf_names.insert(name);
+        record_leaf_manifest(tensor, name);
+      }
     }
     return name;
   }
@@ -382,7 +417,10 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
  private:
   std::string m_generated;
   std::string m_body;
-  std::string m_local_decls;
+  // mutable: written from represent(Tensor)'s lazy-declare fallback, which is
+  // const (see that method's comment on why a lazily-discovered synthesized
+  // "I"-labeled intermediate is emitted as a local declaration here).
+  mutable std::string m_local_decls;
   std::string m_indent = "  ";
   std::string m_current_name;
   std::string m_result_name;
