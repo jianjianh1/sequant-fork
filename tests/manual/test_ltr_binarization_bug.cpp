@@ -56,8 +56,9 @@ void load_convention() {
       mbpt::Context().set(mbpt::make_legacy_registry()));
 }
 
-std::string export_and_print(const ExprPtr &e, const std::string &label) {
-  auto tree = to_export_tree(e, /*retain_braket=*/false);
+std::string export_and_print(const ExprPtr &e, const std::string &label,
+                              IndexSet const &external = {}) {
+  auto tree = to_export_tree(e, /*retain_braket=*/false, external);
   TiledArrayGenerator generator;
   TiledArrayGeneratorContext ctx;
   try {
@@ -102,9 +103,16 @@ int main() {
 
   std::cout << "Product built: " << toUtf8(prod->to_latex()) << "\n";
 
+  // The whole term's TRUE free/external indices -- supplied explicitly here
+  // (as the fix for the make_prod domain-tag-vs-artifact ambiguity requires:
+  // binarize() cannot soundly derive this from local occurrence counts
+  // alone, see eval_expr.cpp's make_prod). i1,i2 recur 3x each (domain tag);
+  // b1,b2 occur once each (plain externals) -- ALL FOUR must survive.
+  IndexSet const external{i1, i2, b1, b2};
+
   // --- Step 1: export WITHOUT optimize() first (flat 3-factor left-to-right
   // fold).  Included for contrast/diagnosis only.
-  export_and_print(prod, "flat (no optimize())");
+  export_and_print(prod, "flat (no optimize())", external);
 
   // --- Step 2: run through the REAL pipeline's optimize() call (same option
   // family as test_csv_ccsd_derivation.cpp: Flops metric, volatile-leaf
@@ -120,7 +128,7 @@ int main() {
   std::cout << "\nOptimized (parenthesized) expression: "
             << toUtf8(optimized->to_latex()) << "\n";
 
-  std::string code = export_and_print(optimized, "post-optimize()");
+  std::string code = export_and_print(optimized, "post-optimize()", external);
 
   bool has_i1 = code.find("i_1") != std::string::npos;
   bool has_i2 = code.find("i_2") != std::string::npos;

@@ -507,7 +507,7 @@ EvalExprNode binarize(Product const& prod, IndexSet const& uncontract,
   auto hvals = factors | transform([](auto&& n) { return n->hash_value(); });
   auto const hs = imed_hashes(hvals) | ranges::to_vector;
 
-  auto make_prod = [i = 0, &hs, &ltr_uncontr_idxs, &opts](
+  auto make_prod = [i = 0, &hs, &ltr_uncontr_idxs, &opts, &uncontract](
                        EvalExprNode const& left,
                        EvalExprNode const& right) mutable -> EvalExpr {
     auto h = ranges::at(hs, ++i);
@@ -540,8 +540,8 @@ EvalExprNode binarize(Product const& prod, IndexSet const& uncontract,
       collect_tensor_factors(left, subfacs);
       collect_tensor_factors(right, subfacs);
       auto ts = subfacs | transform([](auto&& t) { return t.expr; });
-      IndexGroups<IndexVec> const target_indices = [prod = ex<Product>(ts),
-                                                    &uncontracted_idxs]() {
+      IndexGroups<IndexVec> const target_indices =
+          [prod = ex<Product>(ts), &uncontracted_idxs, &uncontract]() {
         // route each surviving hyperindex to its correct slot
         // (bra, ket, or aux) based on which slot it occupies in
         // the factor tensors .. if appears in multiple slots put into aux
@@ -555,23 +555,44 @@ EvalExprNode binarize(Product const& prod, IndexSet const& uncontract,
             // *this* node's two direct operand subtrees against each other
             // (see indices.hpp) -- it has no visibility into occurrences of
             // `k` that live in other, not-yet-combined branches elsewhere in
-            // the overall binarization tree. That local view is exact for a
-            // standard Wick-contraction dummy, which by construction occurs
-            // in EXACTLY 2 tensor-index slots total (one contraction line):
-            // once both have been seen, it truly is fully resolved and must
-            // vanish. An index occurring MORE than twice (v.total() > 2)
-            // cannot be such a dummy at all; it is necessarily a persistent,
-            // non-summed "domain tag" shared by several factors (e.g. the
-            // CSV/PNO occupied-pair index tagging multiple C-transform
-            // tensors and the T amplitude). Such an index must survive this
-            // combination regardless of what the local, two-branch view of
-            // `uncontracted_idxs` concluded -- otherwise it is silently
-            // treated as contracted here even though further, not-yet-
-            // combined occurrences (or the term's own external result) still
-            // need it. See left_to_right_binarization_indices()'s "only
-            // exactly-2-occurrence dummies fully resolve" contract, which
-            // this restores for the >2 case.
-            if (v.total() > 2 || uncontracted_idxs.contains(k))
+            // the overall binarization tree, EXCEPT for what it can infer
+            // from the caller-supplied `uncontract` set (the ENCLOSING
+            // EQUATION's own true external/free indices, threaded all the
+            // way down from to_export_tree()/binarize()'s top-level call --
+            // see indices.hpp's left_to_right_binarization_indices(), which
+            // already consults `uncontract` when computing both
+            // `uncontracted_idxs` and each child's own target set). That
+            // makes `uncontracted_idxs` authoritative whenever the caller
+            // supplied a real external-index set: it forces survival for
+            // (a) a genuine domain tag -- an index that is one of the
+            // equation's own external indices but happens to also recur
+            // across 3+ tensor factors within one term (e.g. the CSV/PNO
+            // occupied-pair index tagging multiple C-transform tensors and
+            // the T amplitude) -- while correctly letting a term-local
+            // index vanish once fully gathered, EVEN IF it also happens to
+            // occur 3+ times (e.g. an artifact of csv_transform's own
+            // per-term C-factor insertion structure that is fresh per term
+            // and never shared across other summands of the enclosing sum).
+            // A prior fix (commit ddd208d5) used a value-blind
+            // "occurs more than twice" threshold here instead, which cannot
+            // distinguish those two cases -- they have IDENTICAL local
+            // occurrence-count signatures (confirmed via matched minimal
+            // repros: test_domain_tag_early_gather.cpp needs the index to
+            // survive, test_orphan_index_survives_too_long.cpp needs the
+            // structurally-identical index to vanish). Directly checking
+            // `uncontract` (the equation's true external set) here too is
+            // redundant with what `uncontracted_idxs` already encodes, but
+            // kept for defense in depth / clarity.
+            //
+            // FALLBACK: when the caller supplies no external-index
+            // information at all (`uncontract` empty -- e.g. legacy
+            // bare-ExprPtr callers that cannot yet supply it), fall back to
+            // the old ">2 occurrences" heuristic so those callers don't
+            // regress. This heuristic is known-unsound in general (see
+            // above) and must never be used when better information (a
+            // non-empty `uncontract`) is available.
+            if (uncontract.contains(k) || uncontracted_idxs.contains(k) ||
+                (uncontract.empty() && v.total() > 2))
               result.aux.emplace_back(k);
             continue;
           }

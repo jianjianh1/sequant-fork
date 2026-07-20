@@ -15,9 +15,12 @@
 #include <SeQuant/core/export/tiledarray_generator.hpp>
 #include <SeQuant/core/expressions/expr_algorithms.hpp>
 #include <SeQuant/core/index_space_registry.hpp>
+#include <SeQuant/core/io/serialization/serialization.hpp>
 #include <SeQuant/core/io/shorthands.hpp>
 #include <SeQuant/core/optimize/optimize.hpp>
 #include <SeQuant/core/rational.hpp>
+#include <SeQuant/core/utility/indices.hpp>
+#include <SeQuant/core/utility/string.hpp>
 #include <SeQuant/domain/mbpt/biorthogonalization.hpp>
 #include <SeQuant/domain/mbpt/context.hpp>
 #include <SeQuant/domain/mbpt/convention.hpp>
@@ -175,6 +178,35 @@ std::string family_sig(const Tensor &t) {
   return oss.str();
 }
 
+// Computes the enclosing equation's own true external/free index set
+// directly from a (post-optimize()) Sum, WITHOUT relying on per-term local
+// occurrence-count parity (get_unique_indices()'s existing Product-level
+// cancellation logic gets this wrong whenever a genuine external index also
+// happens to recur 3+ times within one term, e.g. the CSV/PNO occupied-pair
+// "domain tag" -- see eval_expr.cpp's make_prod fix). Since all summands of
+// a valid Sum MUST share the same external indices (that's what makes them
+// addable as one equation), and SeQuant keeps a fixed equation's own named/
+// external indices literal and identical across every summand (only internal
+// Wick-contraction dummies get freshly renumbered per term), the robust,
+// general signal is: an index is external iff it is present -- REGARDLESS of
+// its local occurrence count -- in literally EVERY summand. Implemented as a
+// straightforward intersection of each summand's own used-index set.
+IndexSet sum_external_indices(const ExprPtr &e) {
+  if (!e->is<Sum>()) return {};
+  const auto &summands = e->as<Sum>().summands();
+  if (summands.empty()) return {};
+
+  IndexSet result = get_used_indices<IndexSet>(summands[0]);
+  for (std::size_t i = 1; i < summands.size() && !result.empty(); ++i) {
+    IndexSet const current = get_used_indices<IndexSet>(summands[i]);
+    IndexSet intersected;
+    for (auto &&ix : result)
+      if (current.contains(ix)) intersected.emplace(ix);
+    result = std::move(intersected);
+  }
+  return result;
+}
+
 void print_structural_summary(const ExprPtr &expr) {
   std::vector<Tensor> tensors;
   collect_tensors(expr, tensors);
@@ -220,8 +252,42 @@ int main() {
     opts.opt_for = OptFor::Flops;
     opts.reorder = ReorderSum::Reorder;
     opts.is_volatile_leaf = [](Tensor const &t) { return t.label() == L"t"; };
+    // FIX (2026-07-20, TA-vs-MPQC performance investigation): the values
+    // below used to fall through to idx.space().approximate_size(), which
+    // for i/mu-tilde/K is IndexSpace's own constructor DEFAULT of 10
+    // (SeQuant/core/space.hpp) -- none of make_sr_spaces()'s add()/
+    // add_pao_spaces()/add_df_spaces() calls pass a real size, unlike
+    // MPQC's own real production path, which overwrites these via
+    // populate_index_extents() (mpqc4:src/mpqc/math/external/sequant/
+    // sequant.h) BEFORE deriving. Concretely this made optimize()'s
+    // OptFor::Flops cost model see a mu-tilde^4-shaped intermediate as
+    // ~10^4=10,000 "flops" when reality is 114^4~1.69e8 -- a ~16,900x
+    // underestimate -- which made routing a contraction through a large
+    // dense mu-tilde-family intermediate look nearly free, a very
+    // plausible cause of whole_t2_residual OOMing past 62GB on real
+    // ethane data (MPQC's own real g x g-family intermediates top out
+    // around 625MB; nothing resembling a dense mu-tilde^4 object ever
+    // appears in its real trace). Real values below are read directly off
+    // this exact ethane run's own registry dump
+    // (mpqc4/traces/checksum-run/ethane-checksum-v2.log:462-474) --
+    // NOTE these are the real ACTIVE-space counts (i=7), not the raw/
+    // padded COO array shape (9, which includes frozen-core rows with an
+    // all-zero PNO domain) -- the registry dump is what MPQC's own
+    // optimize() call actually sees, so it's the correct number to
+    // replicate here.
     opts.idx_to_extent = [](Index const &idx) -> std::size_t {
-      if (idx.has_proto_indices()) return 30;  // plausible avg PNO count
+      if (idx.has_proto_indices()) {
+        // Real average per-pair PNO domain size, measured directly from
+        // this ethane dataset's t_i_1_i_2_a_1_a_2.txt (49 real occupied
+        // pairs, contiguous-range convention matching ta_builder.h's
+        // build_tot_array()) -- was hardcoded to a generic guess of 30.
+        return 45;
+      }
+      const std::wstring &key = idx.space().base_key();
+      if (key == L"i") return 7;     // occupied (active space only)
+      if (key == L"μ̃")    // mu-tilde (CSV/PAO-restricted basis)
+        return 114;
+      if (key == L"Κ") return 282;  // DF/RI auxiliary basis
       return idx.space().approximate_size();
     };
     opts.n_replay = 10;
@@ -238,7 +304,24 @@ int main() {
     std::cout << "Structural summary (label(index-family-sig) x count):\n";
     print_structural_summary(e);
 
-    auto tree = to_export_tree(e, /*retain_braket=*/false);
+    // The enclosing equation's own true external/free index set (e.g. {i;a}
+    // for R1, {i,j;a,b} for R2), derived automatically from cross-summand
+    // commonality -- see sum_external_indices()'s doc comment. This is
+    // threaded through to_export_tree()/binarize() as the authoritative
+    // survival signal for eval_expr.cpp's make_prod fix: a "domain tag"
+    // index (e.g. the CSV/PNO occupied-pair index reused across several
+    // C-transform tensors and the T amplitude within one term) is exactly
+    // one of THESE indices, and must survive a term's own binarization
+    // regardless of how many times it happens to recur locally -- while a
+    // term-local artifact index that merely LOOKS the same (same local
+    // occurrence count) but is NOT one of these must not be force-preserved.
+    IndexSet const eq_external = sum_external_indices(e);
+    std::wcout << L"Equation R" << r << L"'s own external indices ("
+               << eq_external.size() << L"): ";
+    for (auto &&ix : eq_external) std::wcout << ix.label() << L" ";
+    std::wcout << L"\n";
+
+    auto tree = to_export_tree(e, /*retain_braket=*/false, eq_external);
     TiledArrayGenerator generator;
     TiledArrayGeneratorContext ctx;
     std::string fn_name = "whole_t" + std::to_string(r) + "_residual";
@@ -258,6 +341,74 @@ int main() {
                 << generator.leaf_manifest_report();
     } catch (const std::exception &ex) {
       std::cout << "EXCEPTION: " << ex.what() << "\n";
+    }
+
+    // --- Per-summand export (term-by-term numeric cross-check) ----------
+    // Phase 5 tier-3 comparison methodology (twinkly-dazzling-shamir.md):
+    // export EACH top-level summand of the post-optimize Sum as its own
+    // small named function so its checksum can be computed independently
+    // and matched against the corresponding real MPQC trace row, instead
+    // of only comparing the whole-residual sum.
+    if (e->is<Sum>()) {
+      const auto &summands = e->as<Sum>().summands();
+      std::string manifest_path =
+          "/tmp/claude-ta-generator-test/r" + std::to_string(r) + "_terms.tsv";
+      std::ofstream term_manifest(manifest_path);
+      std::cout << "\n=== Exporting " << summands.size() << " individual R"
+                << r << " summands ===\n";
+      for (std::size_t t = 0; t < summands.size(); ++t) {
+        const ExprPtr &term = summands[t];
+        std::string fn_name =
+            "t" + std::to_string(r) + "_term" + std::to_string(t);
+        std::string text = toUtf8(io::serialization::to_string(term));
+        // TSV-safe: strip tabs/newlines from the printed expression.
+        for (char &c : text)
+          if (c == '\t' || c == '\n' || c == '\r') c = ' ';
+
+        term_manifest << fn_name << "\t" << text << "\t";
+        try {
+          auto term_tree =
+              to_export_tree(term, /*retain_braket=*/false, eq_external);
+          TiledArrayGenerator term_gen;
+          TiledArrayGeneratorContext term_ctx;
+          export_group(
+              ExpressionGroup<ExportExpr>{std::move(term_tree), fn_name},
+              term_gen, term_ctx);
+          std::string code = term_gen.get_generated_code();
+          std::string path = "/tmp/claude-ta-generator-test/generated_r" +
+                             std::to_string(r) + "_term" + std::to_string(t) +
+                             ".cpp";
+          std::ofstream out(path);
+          out << "#include <tiledarray.h>\n#include <TiledArray/expressions/"
+                 "einsum.h>\n#include <cmath>\n\n"
+              << code;
+          // Compact leaf manifest, one term's params joined by ';':
+          //   name:label:outer1|outer2:inner1|inner2:ToT|flat
+          const auto &leaves = term_gen.leaf_manifest();
+          for (std::size_t li = 0; li < leaves.size(); ++li) {
+            if (li) term_manifest << ";";
+            const auto &lf = leaves[li];
+            term_manifest << lf.name << ":" << lf.label << ":";
+            for (std::size_t k = 0; k < lf.outer_families.size(); ++k) {
+              if (k) term_manifest << "|";
+              term_manifest << lf.outer_families[k];
+            }
+            term_manifest << ":";
+            for (std::size_t k = 0; k < lf.inner_families.size(); ++k) {
+              if (k) term_manifest << "|";
+              term_manifest << lf.inner_families[k];
+            }
+            term_manifest << ":" << (lf.is_tot ? "ToT" : "flat");
+          }
+          term_manifest << "\n";
+        } catch (const std::exception &ex) {
+          std::string reason = ex.what();
+          for (char &c : reason)
+            if (c == '\t' || c == '\n' || c == '\r') c = ' ';
+          term_manifest << "EXCEPTION:" << reason << "\n";
+        }
+      }
+      std::cout << "wrote " << manifest_path << "\n";
     }
   }
 
