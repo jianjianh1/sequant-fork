@@ -510,23 +510,66 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
   // loader convention (pair-key columns first). This makes every
   // occurrence of a given logical ToT leaf, however SeQuant happened to
   // order its arguments for that term, agree on one fixed outer order.
+  //
+  // SECOND EDGE CASE (2026-07-20, term-by-term real-data localization):
+  // the fix above unconditionally seeds `outer`'s ORDER from the proto-tag
+  // list of the FIRST proto-carrying index encountered (e.g. a<i_1,i_2>'s
+  // own tag order), then lets any directly-appearing occurrence of that
+  // SAME index elsewhere on the tensor be silently absorbed by
+  // contains_index() without ever influencing order. That's harmless for a
+  // tensor like "C", where the occ index (i) appears ONLY via the proto
+  // tag and never as a direct index of C itself -- there is no second,
+  // independent order to conflict with. It is WRONG for a tensor like the
+  // T2 amplitude "t", whose two occ indices are BOTH proto tags of its own
+  // virtual indices (a<i_1,i_2>, a'<i_1,i_2>) AND its own literal ket
+  // members -- e.g. t{a<i_1,i_2>,a'<i_1,i_2>; i_2,i_1} has ket order
+  // (i_2,i_1), the REVERSE of the proto tag order (i_1,i_2) that a's own
+  // tag list happens to carry (that tag list is fixed once, at
+  // domain-index creation, and is agnostic to how later binarization/CSE
+  // permuted this particular occurrence's own ket). Since t_ij^ab and
+  // t_ji^ab are genuinely different physical values (confirmed: the real
+  // ToT leaf stores all 7x7=49 ordered occupied-pair entries, not a
+  // symmetrized subset), silently overriding the ket's own order with the
+  // proto tag's order computes the WRONG element for any occurrence whose
+  // ket order disagrees with its proto tag order -- confirmed against real
+  // ethane data for t1_term9/t1_term21/t2_term24 (0.3-0.7x off; their
+  // "twin" terms t1_term10/t1_term22/t2_term54, whose ket order happens to
+  // already agree with the proto tag order, were unaffected).
+  //
+  // Fix: give a directly-appearing occurrence of an outer index PRIORITY
+  // over the proto-tag-derived order for that same index -- i.e. determine
+  // order primarily from the tensor's own direct (non-proto) index list
+  // (in its own ket/bra order, exactly as SeQuant intends), and only
+  // fall back to proto-tag order (inserted at the front, preserving the
+  // original "pair key columns first" convention) for a proto tag that has
+  // NO direct counterpart on this tensor at all (the "C"-shaped case).
   IndexClass classify_indices(const Tensor &tensor) const {
     IndexClass result;
+    // Pass 1: direct (non-proto) indices, in the tensor's OWN order --
+    // authoritative whenever an outer index also appears directly (its
+    // order can be physically meaningful, e.g. t's i,i ket order).
     for (const Index &idx : tensor.const_indices()) {
       if (idx.has_proto_indices()) {
-        for (const Index &proto : idx.proto_indices()) {
-          if (!contains_index(result.outer, proto))
-            result.outer.push_back(proto);
-        }
-      }
-    }
-    for (const Index &idx : tensor.const_indices()) {
-      if (!idx.has_proto_indices()) {
-        if (!contains_index(result.outer, idx)) result.outer.push_back(idx);
-      } else {
         result.inner.push_back(idx.drop_proto_indices());
+      } else if (!contains_index(result.outer, idx)) {
+        result.outer.push_back(idx);
       }
     }
+    // Pass 2: proto tags with no direct counterpart on this tensor (e.g.
+    // "C"'s occ index, which exists only as a<i>'s proto tag) -- inserted
+    // at the front, in encounter order, matching the pre-existing
+    // pair-key-first convention.
+    std::vector<Index> proto_only;
+    for (const Index &idx : tensor.const_indices()) {
+      if (!idx.has_proto_indices()) continue;
+      for (const Index &proto : idx.proto_indices()) {
+        if (!contains_index(result.outer, proto) &&
+            !contains_index(proto_only, proto))
+          proto_only.push_back(proto);
+      }
+    }
+    result.outer.insert(result.outer.begin(), proto_only.begin(),
+                         proto_only.end());
     result.is_tot = !result.inner.empty();
     return result;
   }
