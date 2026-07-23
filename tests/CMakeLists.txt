@@ -45,6 +45,7 @@ endfunction()
 
 add_subdirectory(unit)
 add_subdirectory(integration)
+add_subdirectory(manual)
 
 # target for running ALL tests
 add_custom_target_subproject(sequant check
