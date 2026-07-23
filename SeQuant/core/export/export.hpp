@@ -1028,6 +1028,19 @@ void export_groups(Range groups, Generator<Context> &generator, Context ctx) {
 }
 
 /// @param expr The expression to transform
+/// @param retain_braket Whether to keep intermediates' bra/ket indices split
+///        instead of merging them into one sorted index list
+/// @param external The set of indices that must be treated as external
+///        (uncontracted) even if their local occurrence count within @p expr
+///        would otherwise look fully resolved -- e.g. the enclosing
+///        equation's own true external/free indices (its `ResultExpr`'s own
+///        indices), when @p expr is only ONE summand of a larger Sum and
+///        therefore cannot re-derive that set from its own content alone.
+///        Forwarded verbatim to binarize(ExprPtr, IndexSet const&, ...); see
+///        eval_expr.cpp's `make_prod` for how this disambiguates a genuine
+///        multiply-recurring "domain tag" external index from a term-local
+///        artifact index that happens to share the same local occurrence
+///        count. Defaults to empty for full backward compatibility.
 /// @returns The corresponding ExportNode tree
 /// @note Prefer the ResultExpr overload below: the bare-ExprPtr path goes
 ///       through binarize(ExprPtr), which derives the tree head's bra/ket
@@ -1038,9 +1051,10 @@ void export_groups(Range groups, Generator<Context> &generator, Context ctx) {
 ///       here.
 template <typename NodeData = ExportExpr>
 ExportNode<NodeData> to_export_tree(const ExprPtr &expr,
-                                    bool retain_braket = false) {
+                                    bool retain_braket = false,
+                                    IndexSet const &external = {}) {
   SEQUANT_PRAGMA_IGNORE_DEPRECATED_BEGIN
-  return binarize<NodeData>(expr, {}, {.merge_indices = !retain_braket});
+  return binarize<NodeData>(expr, external, {.merge_indices = !retain_braket});
   SEQUANT_PRAGMA_IGNORE_DEPRECATED_END
 }
 

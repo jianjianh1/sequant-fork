@@ -860,6 +860,27 @@ struct LTRUncontractedIndices {
 /// of the algorithm.
 ///   Neither will passing indices that do not appear in any of the sets from
 ///   'rng'.
+/// - CAUTION for callers that invoke this once per node of an *already*
+///   binarized (pairwise) tree, e.g. eval_expr.cpp's binarize(Product const&,
+///   ...): `rng` here only ever spans that one node's own direct children, so
+///   an index whose count reaches its local total (i.e. `v == mk` for every
+///   key by the last entry of `imed`) is indistinguishable from a genuine,
+///   fully-resolved 2-occurrence Wick dummy -- this function has no way to
+///   tell whether further occurrences of that same index exist in a sibling
+///   subtree elsewhere in the larger tree that hasn't been combined yet. That
+///   is exactly what happens for an index shared by 3+ tensor factors of a
+///   single term (e.g. a CSV/PNO occupied-pair "domain tag" carried by
+///   several C-transform tensors and the T amplitude, never actually summed):
+///   if the caller's own `uncontract` doesn't happen to already list it, this
+///   function's `imed` will drop it the moment its local occurrences are
+///   exhausted, even though it must survive further up the tree. This
+///   function's output alone cannot fix that (it lacks global visibility);
+///   the actual fix for this case lives one level up, in the caller
+///   (eval_expr.cpp's `binarize(Product const&, ...)` / its `make_prod`
+///   helper), which has access to each index's true whole-term occurrence
+///   count and can force survival whenever that count exceeds 2 (impossible
+///   for a real pairwise dummy) regardless of what `imed`/`uncontract` alone
+///   would conclude.
 ///
 /// @tparam T The type of the index.
 /// @tparam Set The type of the set container.
