@@ -463,7 +463,27 @@ int main() {
     // cck.ipp:1522-1539 (seq_opt_ == true for this dataset)
     flatten(e);
     OptimizeOptions opts;
-    opts.opt_for = OptFor::Flops;
+    // SPTC_OPT_MEMSIZE (2026-07-29, cold-gap refactor attempt -- REJECTED, kept
+    // as a gated experiment knob). Motivation: the OptFor::Flops cost model
+    // (single_term.hpp flops_counter) has NO per-outer-cell/per-block task-
+    // overhead term, so it prices the (μ̃,Κ)-both-outer DF half-transform
+    // intermediate I_ap2_μ̃_Κ[i,i,μ̃,Κ;a] -- millions of tiny per-pair PNO cells
+    // -- as cheap dense flops (it runs ~100x off peak at runtime; see
+    // sequant-ta-repro docs/MPQC_EVALUATION.md §8). Hypothesis: OptFor::Memsize,
+    // which penalizes the ~7e7-element intermediate, would pick an order that
+    // never holds aux(Κ) and PAO(μ̃) open at once.
+    // RESULT (measured, R2): it does the OPPOSITE -- Memsize emits MORE such
+    // tiny-cell intermediates than Flops (3 vs 2; SPTC_NO_CSE=1 gives 4 -- so
+    // cross-term CSE actually merges/reduces them). The (μ̃,Κ)-inner form is
+    // structurally impossible anyway (inner ⇔ proto, and μ̃/Κ are non-proto/
+    // global). The only setting that removes them is a large proto extent
+    // (SPTC_PROTO_EXTENT=100 -> 0), but that swaps in a more-expensive
+    // μ̃-family factorization that is slower with owning-ToT and numerically
+    // divergent at cc-pVTZ. Conclusion: the (μ̃,Κ)-outer tiny-cell half-
+    // transform is the flops-optimal factorization; no correctness-safe
+    // generator knob avoids it. Knob kept (gated; OptFor::Flops stays default).
+    opts.opt_for =
+        std::getenv("SPTC_OPT_MEMSIZE") ? OptFor::Memsize : OptFor::Flops;
     opts.reorder = ReorderSum::Reorder;
     opts.is_volatile_leaf = [](Tensor const &t) { return t.label() == L"t"; };
     // FIX (2026-07-20, TA-vs-MPQC performance investigation): the values
@@ -489,14 +509,16 @@ int main() {
     // all-zero PNO domain) -- the registry dump is what MPQC's own
     // optimize() call actually sees, so it's the correct number to
     // replicate here.
-    opts.idx_to_extent = [](Index const &idx) -> std::size_t {
-      if (idx.has_proto_indices()) {
-        // Real average per-pair PNO domain size, measured directly from
-        // this ethane dataset's t_i_1_i_2_a_1_a_2.txt (49 real occupied
-        // pairs, contiguous-range convention matching ta_builder.h's
-        // build_tot_array()) -- was hardcoded to a generic guess of 30.
-        return 45;
-      }
+    // Perf-parity Phase B: SPTC_PROTO_EXTENT / SPTC_NREPLAY override the
+    // optimizer's proto (PNO) extent and replay count to test whether the
+    // giant μ̃³ / μ̃Κ DF intermediates the trace found are an artifact of
+    // the extent model or an under-searched contraction order.
+    std::size_t proto_ext = 45;
+    if (const char *v = std::getenv("SPTC_PROTO_EXTENT")) proto_ext = std::atoi(v);
+    std::size_t nreplay = 10;
+    if (const char *v = std::getenv("SPTC_NREPLAY")) nreplay = std::atoi(v);
+    opts.idx_to_extent = [proto_ext](Index const &idx) -> std::size_t {
+      if (idx.has_proto_indices()) return proto_ext;
       const std::wstring &key = idx.space().base_key();
       if (key == L"i") return 7;     // occupied (active space only)
       if (key == L"μ̃")    // mu-tilde (CSV/PAO-restricted basis)
@@ -504,7 +526,7 @@ int main() {
       if (key == L"Κ") return 282;  // DF/RI auxiliary basis
       return idx.space().approximate_size();
     };
-    opts.n_replay = 10;
+    opts.n_replay = nreplay;
     e = optimize(e, opts);
 
     std::cout << "=== Residual R" << r << " (post full pipeline) ===\n";
@@ -623,7 +645,12 @@ int main() {
     // summands (the rest export individually, un-deduped but still
     // correct) -- this is exactly how bug 2 above was isolated to its
     // minimal N=46 reproducing case, which led directly to the fix above.
-    bool use_cross_term_cse = true;
+    // SPTC_NO_CSE=1 disables cross-term CSE (performance-parity Phase B:
+    // the per-op trace showed cross-term CSE creates giant merged
+    // intermediates, e.g. a 70M-nnz i,i,μ̃,Κ;a node = ~1s of T2, that
+    // MPQC's per-summand trees never form — test per-summand-only codegen).
+    bool use_cross_term_cse = !(std::getenv("SPTC_NO_CSE") &&
+                                std::atoi(std::getenv("SPTC_NO_CSE")) != 0);
     int cse_bisect_n = -1;
     if (r == 2) {
       if (const char* v = std::getenv("SPTC_CSE_BISECT_N")) {
