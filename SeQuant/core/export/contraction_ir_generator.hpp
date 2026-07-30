@@ -47,7 +47,6 @@
 #include <cwctype>
 #include <functional>
 #include <map>
-#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -409,7 +408,11 @@ class ContractionIRGenerator : public Generator<Context> {
       // A symbolic scalar coefficient (prunable_scalars()==All permits the
       // driver to fold Variables into the product). CC residual prefactors are
       // numeric, so this is rarely hit, but fold the variable's name into the
-      // scalar rather than falling through to the throw below.
+      // scalar rather than falling through to the throw below. NOTE: a Variable
+      // that is itself *computed* would not be defined anywhere in the IR --
+      // compute(const Expr&, const Variable&) is a no-op (scalar defs aren't
+      // rendered) -- so this fold assumes the Variable is an input coefficient,
+      // which holds for this residual (no computed symbolic scalars).
       const std::string nm = toUtf8(e.as<Variable>().label());
       scalar = scalar.empty() ? nm : scalar + "*" + nm;
     } else if (e.is<Product>()) {
