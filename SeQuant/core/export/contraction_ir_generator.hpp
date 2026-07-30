@@ -175,20 +175,29 @@ class ContractionIRGenerator : public Generator<Context> {
       // uses count) are lost.
       c.operands.push_back({oname, op_is_leaf ? SIZE_MAX : last_value(oname)});
       if (op_is_leaf && toUtf8(op.label()) == "t") c.intrinsic_volatile = true;
-      for (const Index &i : op.const_indices()) {
+      // An index is contracted (summed) if it is on an operand but not on the
+      // result. Consider proto-tag (pair-key) indices too, not just direct
+      // ones: a pair key summed BETWEEN two ToT operands appears only as a
+      // proto tag and would otherwise be dropped (result_idx already includes
+      // protos, so surviving pair keys are still correctly excluded).
+      auto consider_contracted = [&](const Index &i) {
         record_space_extents_one(i, ctx);
         const std::wstring lbl(i.label());
-        if (result_idx.count(lbl) || !seen.insert(lbl).second) continue;
+        if (result_idx.count(lbl) || !seen.insert(lbl).second) return;
         c.contracted.push_back(i);
-        const std::wstring sk = space_key(i);
-        if (sk == L"Κ" || sk == L"K") {
+        if (space_key(i) == L"Κ") {
           c.batch_aux = true;
           c.batch_axis = toUtf8(i.label());
         }
+      };
+      for (const Index &i : op.const_indices()) {
+        consider_contracted(i);
+        for (const Index &p : i.proto_indices()) consider_contracted(p);
       }
     }
     // per-contribution flops ~= product over distinct index labels in the
-    // contraction (result outer/inner + pair keys + everything in operands).
+    // contraction (result outer/inner + pair keys + everything in operands,
+    // including operands' proto (pair-key) tags).
     double flops = 1.0;
     std::set<std::wstring> counted;
     auto mul = [&](const Index &i) {
@@ -198,7 +207,10 @@ class ContractionIRGenerator : public Generator<Context> {
     for (const Index &i : result.const_indices()) mul(i);
     for (const Index &i : m_values[vi].pair_key) mul(i);
     for (const Tensor &op : operands)
-      for (const Index &i : op.const_indices()) mul(i);
+      for (const Index &i : op.const_indices()) {
+        mul(i);
+        for (const Index &p : i.proto_indices()) mul(p);
+      }
     c.flops = flops;
     m_values[vi].contribs.push_back(std::move(c));
   }
@@ -212,7 +224,11 @@ class ContractionIRGenerator : public Generator<Context> {
     unload(tensor, ctx);
   }
   void persist(const Tensor &tensor, const Context &) override {
-    m_result_slot = var_name(tensor);
+    // persist() fires once per tree root; the residual is exported as a forest
+    // of many trees (hoisted-CSE roots + residual-summand roots), so record ALL
+    // persisted slots rather than last-write-wins -- the true residual is
+    // identified in analyze() as the persisted, still-live, unconsumed value.
+    m_result_slots.insert(var_name(tensor));
   }
 
   // --- unused Generator hooks (no-ops) -------------------------------------
@@ -291,10 +307,7 @@ class ContractionIRGenerator : public Generator<Context> {
     m_space_ext.emplace(space_key(i), ext(ctx, i));
     // A proto-carrying index's OWN space is the per-pair PNO space -- record
     // its key so the legend lists it once as a per-pair domain, not twice.
-    if (i.has_proto_indices()) {
-      m_pno_keys.insert(space_key(i));
-      if (!m_proto_ext) m_proto_ext = ext(ctx, i);
-    }
+    if (i.has_proto_indices()) m_pno_keys.insert(space_key(i));
   }
   void record_space_extents(const Tensor &t, const Context &ctx) {
     for (const Index &i : t.const_indices()) record_space_extents_one(i, ctx);
@@ -392,6 +405,13 @@ class ContractionIRGenerator : public Generator<Context> {
       ops.push_back(e.as<Tensor>());
     } else if (e.is<Constant>()) {
       append_scalar(scalar, to_double(e.as<Constant>().value().real()));
+    } else if (e.is<Variable>()) {
+      // A symbolic scalar coefficient (prunable_scalars()==All permits the
+      // driver to fold Variables into the product). CC residual prefactors are
+      // numeric, so this is rarely hit, but fold the variable's name into the
+      // scalar rather than falling through to the throw below.
+      const std::string nm = toUtf8(e.as<Variable>().label());
+      scalar = scalar.empty() ? nm : scalar + "*" + nm;
     } else if (e.is<Product>()) {
       const Product &p = e.as<Product>();
       if (!p.scalar().is_identity())
@@ -460,11 +480,14 @@ class ContractionIRGenerator : public Generator<Context> {
       Value &v = m_values[vi];
       for (const Contribution &c : v.contribs)
         if (c.batch_aux) v.batch_aux = true;
-      // the result value is the one whose slot is the persisted output and is
-      // still the live value for that slot at end (the result is never freed).
+      // the residual is the value whose slot was persisted, is still the live
+      // value for that slot at end (never freed), and is not consumed by any
+      // other value (uses==0). This is order-independent -- unlike keying on a
+      // last-write-wins persisted slot -- and excludes hoisted CSE roots (which
+      // are persisted but have uses>=1). `uses` was filled in pass (a) above.
       auto lit = m_live.find(v.slot);
-      v.is_result = (v.slot == m_result_slot && lit != m_live.end() &&
-                     lit->second == vi);
+      v.is_result = (m_result_slots.count(v.slot) && lit != m_live.end() &&
+                     lit->second == vi && v.uses == 0);
       // max over ToT values only: CELL-BOUND is about the per-pair-cell
       // tile-task overhead specific to tensor-of-tensor contractions, so a
       // large FLAT intermediate must not inflate the threshold.
@@ -502,8 +525,7 @@ class ContractionIRGenerator : public Generator<Context> {
     for (const auto &[k, e] : m_space_ext)
       if (!m_pno_keys.count(k)) o << "  " << toUtf8(k) << "=" << e;
     for (const std::wstring &k : m_pno_keys)
-      o << "  " << toUtf8(k) << "=PNO⟨per-pair⟩~"
-        << (m_proto_ext ? *m_proto_ext : m_space_ext.at(k));
+      o << "  " << toUtf8(k) << "=PNO⟨per-pair⟩~" << m_space_ext.at(k);
     o << "\n";
 
     o << "\nleaves:\n";
@@ -533,6 +555,9 @@ class ContractionIRGenerator : public Generator<Context> {
         for (const Contribution &c : v.contribs)
           o << "          " << render_contrib(c, cn) << "\n";
       }
+      // For a Σ (multi-contribution) value, flops is summed over contributions
+      // while cells is the single shared result shape, so per-cell here is an
+      // aggregate ratio (total work / result cells), not one contraction's cost.
       double tot_flops = 0;
       for (const Contribution &c : v.contribs) tot_flops += c.flops;
       o << "      cost: cells=" << sci(static_cast<double>(v.cells))
@@ -677,8 +702,7 @@ class ContractionIRGenerator : public Generator<Context> {
     m_names.clear();
     m_space_ext.clear();
     m_pno_keys.clear();
-    m_proto_ext.reset();
-    m_result_slot.clear();
+    m_result_slots.clear();
     m_fn.clear();
   }
 
@@ -692,8 +716,7 @@ class ContractionIRGenerator : public Generator<Context> {
   mutable std::unordered_map<std::string, std::string> m_names;
   std::map<std::wstring, std::size_t> m_space_ext;
   std::set<std::wstring> m_pno_keys;
-  std::optional<std::size_t> m_proto_ext;
-  std::string m_result_slot;
+  std::set<std::string> m_result_slots;
   std::string m_fn;
 };
 
