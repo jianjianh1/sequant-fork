@@ -11,6 +11,7 @@
 // "only C/t carry proto_indices" invariant, then feed the result into
 // TiledArrayGenerator.
 #include <SeQuant/core/context.hpp>
+#include <SeQuant/core/export/contraction_ir_generator.hpp>
 #include <SeQuant/core/export/export.hpp>
 #include <SeQuant/core/export/tiledarray_generator.hpp>
 #include <SeQuant/core/expressions/expr_algorithms.hpp>
@@ -704,9 +705,36 @@ int main() {
     } else {
       forest.push_back(to_export_tree(e, /*retain_braket=*/false, eq_external));
     }
+    std::string fn_name = "whole_t" + std::to_string(r) + "_residual";
+
+    // --- Contraction IR (CTIR) export: same forest, human-readable backend --
+    // A descriptive, DAG-structured view that surfaces what the einsum C++
+    // hides -- per-outer-cell cost (CELL-BOUND flag), t-indep/t-dep +
+    // persistent classification, and aux-K batchability. Runs BEFORE the
+    // einsum export below (which moves `forest`), on a copy of the same
+    // post-CSE forest, so `uses=N` reflects the identical cross-term sharing.
+    {
+      auto ir_forest = forest;  // copy; einsum export moves the original
+      ContractionIRGenerator<> ir_gen;
+      ContractionIRGeneratorContext ir_ctx;
+      ir_ctx.extent = opts.idx_to_extent;
+      try {
+        export_group(
+            ExpressionGroup<ExportExpr>{std::move(ir_forest), fn_name},
+            ir_gen, ir_ctx);
+        std::string ir_path =
+            "/tmp/claude-ta-generator-test/generated_R" + std::to_string(r) +
+            ".ctir";
+        std::ofstream ir_out(ir_path);
+        ir_out << ir_gen.get_generated_code();
+        std::cout << "wrote " << ir_path << "\n";
+      } catch (const std::exception &ex) {
+        std::cout << "CTIR EXCEPTION: " << ex.what() << "\n";
+      }
+    }
+
     TiledArrayGenerator generator;
     TiledArrayGeneratorContext ctx;
-    std::string fn_name = "whole_t" + std::to_string(r) + "_residual";
     try {
       export_group(ExpressionGroup<ExportExpr>{std::move(forest), fn_name},
                   generator, ctx);
