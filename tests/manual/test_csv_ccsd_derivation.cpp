@@ -13,6 +13,7 @@
 #include <SeQuant/core/context.hpp>
 #include <SeQuant/core/export/contraction_ir_generator.hpp>
 #include <SeQuant/core/export/export.hpp>
+#include <SeQuant/core/export/python_einsum.hpp>
 #include <SeQuant/core/export/tiledarray_generator.hpp>
 #include <SeQuant/core/expressions/expr_algorithms.hpp>
 #include <SeQuant/core/index_space_registry.hpp>
@@ -730,6 +731,31 @@ int main() {
         std::cout << "wrote " << ir_path << "\n";
       } catch (const std::exception &ex) {
         std::cout << "CTIR EXCEPTION: " << ex.what() << "\n";
+      }
+    }
+
+    // --- NumPy einsum export: SAME forest, a second (framework-agnostic)
+    // backend. Proves the contraction sequence is portable off SeQuant's
+    // Generator<Context> plug-in with no backend-specific work -- run by
+    // sequant-ta-repro/tools/numpy_runner.py. Emitted from a copy taken BEFORE
+    // the TiledArray export moves `forest`. Index-space shapes are left
+    // symbolic (dim_<space>); the runner binds them from the loaded leaves.
+    {
+      auto np_forest = forest;  // copy; einsum export below moves the original
+      NumPyEinsumGenerator np_gen;
+      NumPyEinsumGeneratorContext np_ctx;
+      try {
+        export_group(
+            ExpressionGroup<ExportExpr>{std::move(np_forest), fn_name},
+            np_gen, np_ctx);
+        std::string np_path =
+            "/tmp/claude-ta-generator-test/generated_R" + std::to_string(r) +
+            ".py";
+        std::ofstream np_out(np_path);
+        np_out << np_gen.get_generated_code();
+        std::cout << "wrote " << np_path << "\n";
+      } catch (const std::exception &ex) {
+        std::cout << "NUMPY EXCEPTION: " << ex.what() << "\n";
       }
     }
 
