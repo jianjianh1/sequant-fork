@@ -1,13 +1,24 @@
 #ifndef SEQUANT_CORE_OPTIMIZE_OPTIONS_HPP
 #define SEQUANT_CORE_OPTIMIZE_OPTIONS_HPP
 
+#include <SeQuant/core/algorithm.hpp>
+
 #include <cstddef>
 #include <functional>
+#include <optional>
 
 namespace sequant {
 
 class Index;
+class Product;
 class Tensor;
+
+/// Optional caller-supplied planner for one pure tensor product. Returning a
+/// postfix evaluation sequence overrides the built-in single-term optimizer;
+/// std::nullopt requests the existing optimizer. The callback may run
+/// concurrently for distinct summands and must therefore be thread-safe.
+using single_term_planner_t =
+    std::function<std::optional<EvalSequence>(Product const&)>;
 
 /// Cost metric to optimize for in single-term and top-level optimize routines.
 enum class OptFor { Flops, Memsize };
@@ -46,6 +57,11 @@ struct OptimizeOptions {
   /// Caller-supplied Index to extent provider. If empty, defaults to
   /// \c IndexSpace::approximate_size().
   index_to_extent_t idx_to_extent = {};
+
+  /// Optional external contraction-tree provider. Tensor ordinals exclude
+  /// scalar factors and use EvalSequence's postfix -1 contraction marker.
+  /// Empty preserves the built-in optimizer. Mixed products bypass it.
+  single_term_planner_t single_term_planner = {};
 
   /// Marks a LEAF tensor as volatile: its value changes between replays of the
   /// network, so any contraction depending on it is re-evaluated on every

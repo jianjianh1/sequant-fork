@@ -33,6 +33,17 @@ index_to_extent_t default_idx_to_size() {
 
 /// Optimize a Product that contains only Tensor and scalar factors.
 ExprPtr opt_pure_product(Product const& prod, OptimizeOptions const& opts) {
+  if (opts.single_term_planner) {
+    bool has_tensor = false;
+    for (auto const& factor : prod)
+      if (factor->is<Tensor>()) {
+        has_tensor = true;
+        break;
+      }
+    if (has_tensor)
+      if (auto sequence = opts.single_term_planner(prod); sequence)
+        return opt::apply_eval_sequence(prod, *sequence);
+  }
   bool const subnet_cse = opts.subnet_cse == SubnetCSE::Enable;
   if (opts.opt_for == OptFor::Flops)
     return opt::single_term_opt<OptFor::Flops>(
@@ -70,8 +81,10 @@ ExprPtr opt_mixed_product(Product const& prod, OptimizeOptions const& opts) {
     }
   }
 
+  auto builtin_opts = opts;
+  builtin_opts.single_term_planner = {};
   auto result = opt_pure_product(
-      Product{prod.scalar(), new_factors, Product::Flatten::No}, opts);
+      Product{prod.scalar(), new_factors, Product::Flatten::No}, builtin_opts);
 
   auto replacer = [&non_tensors](ExprPtr& out) {
     if (!out->is<Tensor>()) return;

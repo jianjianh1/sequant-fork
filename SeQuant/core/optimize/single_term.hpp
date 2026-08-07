@@ -22,7 +22,9 @@
 #include <bit>
 #include <functional>
 #include <limits>
+#include <stdexcept>
 #include <type_traits>
+#include <vector>
 
 namespace sequant::opt {
 
@@ -402,6 +404,78 @@ EvalSequence single_term_opt(
 
 }  // namespace detail
 
+/// Build a parenthesized product from a SeQuant postfix evaluation sequence.
+///
+/// Non-negative entries identify tensor-factor ordinals (scalar factors do not
+/// consume ordinals); -1 contracts the top two stack entries. Every tensor must
+/// occur exactly once and the stack must finish with one expression. Malformed
+/// sequences throw std::invalid_argument. Scalar factors and the Product scalar
+/// are attached exactly once to the resulting tree.
+inline ExprPtr apply_eval_sequence(Product const& prod,
+                                   EvalSequence const& sequence) {
+  using ranges::views::filter;
+  using ranges::views::reverse;
+
+  auto const tensors =
+      prod | filter(&ExprPtr::template is<Tensor>) | ranges::to_vector;
+  auto const ntensors = tensors.size();
+  if (ntensors == 0)
+    throw std::invalid_argument(
+        "apply_eval_sequence requires at least one tensor factor");
+  if (sequence.size() != 2 * ntensors - 1)
+    throw std::invalid_argument(
+        "evaluation sequence length does not match tensor-factor count");
+
+  std::vector<bool> seen(ntensors, false);
+  container::svector<ExprPtr> stack;
+  stack.reserve(ntensors);
+  for (auto const value : sequence) {
+    if (value >= 0) {
+      auto const ordinal = static_cast<std::size_t>(value);
+      if (ordinal >= ntensors)
+        throw std::invalid_argument(
+            "evaluation sequence tensor ordinal is out of range");
+      if (seen[ordinal])
+        throw std::invalid_argument(
+            "evaluation sequence repeats a tensor ordinal");
+      seen[ordinal] = true;
+      stack.push_back(tensors[ordinal]);
+      continue;
+    }
+    if (value != -1)
+      throw std::invalid_argument(
+          "evaluation sequence contains an invalid negative marker");
+    if (stack.size() < 2)
+      throw std::invalid_argument("evaluation sequence stack underflow");
+    auto right = std::move(stack.back());
+    stack.pop_back();
+    auto left = std::move(stack.back());
+    stack.pop_back();
+    stack.push_back(ex<Product>(
+        Product{1, ExprPtrList{left, right}, Product::Flatten::No}));
+  }
+  if (std::ranges::find(seen, false) != seen.end())
+    throw std::invalid_argument(
+        "evaluation sequence does not contain every tensor ordinal");
+  if (stack.size() != 1)
+    throw std::invalid_argument(
+        "evaluation sequence does not finish with one expression");
+
+  ExprPtr result = std::move(stack.back());
+  if (!result->is<Product>()) {
+    result = ex<Product>(
+        Product{1, ExprPtrList{result}, Product::Flatten::No});
+  }
+  auto& result_product = result->as<Product>();
+  for (auto&& scalar :
+       prod | reverse | filter([](ExprPtr const& expr) {
+         return expr->is_scalar();
+       }))
+    result_product.prepend(1, scalar, Product::Flatten::No);
+  result_product.scale(prod.scalar());
+  return result;
+}
+
 ///
 /// \tparam Metric Cost metric to optimize for (Flops by default; Memsize
 ///         minimizes total operand memory rather than flops).
@@ -417,37 +491,15 @@ ExprPtr single_term_opt(
     std::function<bool(Tensor const&)> const& is_volatile_leaf = {},
     unsigned n_replay = 1) {
   using ranges::views::filter;
-  using ranges::views::reverse;
-
-  if (prod.factors().size() < 3)
-    return ex<Product>(Product{prod.scalar(), prod.factors().begin(),
-                               prod.factors().end(), Product::Flatten::No});
   auto const tensors =
       prod | filter(&ExprPtr::template is<Tensor>) | ranges::to_vector;
+  if (tensors.size() < 3)
+    return ex<Product>(Product{prod.scalar(), prod.factors().begin(),
+                               prod.factors().end(), Product::Flatten::No});
   auto seq = detail::single_term_opt<Metric>(
       TensorNetwork{tensors}, std::forward<IdxToSz>(idxsz), subnet_cse,
       is_volatile_leaf, n_replay);
-  auto result = container::svector<ExprPtr>{};
-  for (auto i : seq)
-    if (i == -1) {
-      auto rexpr = *result.rbegin();
-      result.pop_back();
-      auto lexpr = *result.rbegin();
-      result.pop_back();
-      auto p = Product{1, ExprPtrList{lexpr, rexpr}, Product::Flatten::No};
-      result.push_back(ex<Product>(Product{
-          1, p.factors().begin(), p.factors().end(), Product::Flatten::No}));
-    } else {
-      result.push_back(tensors.at(i));
-    }
-
-  auto& p_ = (*result.rbegin()).as<Product>();
-  for (auto&& v :
-       prod | reverse | filter([](const ExprPtr& e) { return e->is_scalar(); }))
-    p_.prepend(1, v, Product::Flatten::No);
-
-  p_.scale(prod.scalar());
-  return *result.rbegin();
+  return apply_eval_sequence(prod, seq);
 }
 
 }  // namespace sequant::opt

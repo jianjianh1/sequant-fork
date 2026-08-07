@@ -16,9 +16,12 @@
 #include <SeQuant/core/space.hpp>
 #include <SeQuant/domain/mbpt/convention.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <initializer_list>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 
 sequant::ExprPtr extract(sequant::ExprPtr expr,
                          std::initializer_list<size_t> const& idxs) {
@@ -343,6 +346,126 @@ TEST_CASE("optimize", "[optimize]") {
       REQUIRE(*optimize(sum) == *reorder);
     }
 
+    SECTION("OptimizeOptions: external single-term planner") {
+      auto const prod = parse_expr_antisymm(
+                            L"1/4 A{i1;a1} B{a1;i2} C{i2;i1}")
+                            ->as<Product>();
+      bool called = false;
+      OptimizeOptions opts;
+      opts.single_term_planner =
+          [&](Product const& seen) -> std::optional<EvalSequence> {
+        called = true;
+        REQUIRE(seen.size() == prod.size());
+        return EvalSequence{1, 2, -1, 0, -1};
+      };
+
+      auto const result = optimize(ex<Product>(prod), opts);
+      REQUIRE(called);
+      REQUIRE(result->as<Product>().scalar() == prod.scalar());
+      REQUIRE(extract(result, {0, 0}) == prod.at(1));
+      REQUIRE(extract(result, {0, 1}) == prod.at(2));
+      REQUIRE(extract(result, {1}) == prod.at(0));
+
+      opts.single_term_planner =
+          [](Product const&) -> std::optional<EvalSequence> {
+        return std::nullopt;
+      };
+      REQUIRE(*optimize(ex<Product>(prod), opts) ==
+              *optimize(ex<Product>(prod)));
+    }
+
+    SECTION("External evaluation sequence preserves factor identity") {
+      auto const repeated =
+          parse_expr_antisymm(L"A{i1;a1} A{i2;a2} B{a1,a2;i1,i2}")
+              ->as<Product>();
+      auto const result =
+          opt::apply_eval_sequence(repeated, EvalSequence{1, 2, -1, 0, -1});
+
+      // Repeated tensor labels with different slots remain distinct ordinals.
+      REQUIRE(extract(result, {0, 0}) == repeated.at(1));
+      REQUIRE(extract(result, {0, 1}) == repeated.at(2));
+      REQUIRE(extract(result, {1}) == repeated.at(0));
+
+      auto const with_scalars =
+          deserialize(L"2 α β A{i1;a1} B{a1;i2} C{i2;i1}")
+              ->as<Product>();
+      auto const scaled = opt::apply_eval_sequence(
+          with_scalars, EvalSequence{0, 1, -1, 2, -1});
+      REQUIRE(scaled->as<Product>().scalar() == with_scalars.scalar());
+      REQUIRE(scaled->as<Product>().size() == 4);
+      REQUIRE(scaled->at(0) == with_scalars.at(0));
+      REQUIRE(scaled->at(1) == with_scalars.at(1));
+      REQUIRE(extract(scaled, {2, 0}) == with_scalars.at(2));
+      REQUIRE(extract(scaled, {2, 1}) == with_scalars.at(3));
+      REQUIRE(scaled->at(3) == with_scalars.at(4));
+    }
+
+    SECTION("External evaluation sequence handles small products") {
+      auto const a = deserialize(L"A{i1;a1}");
+      auto const b = deserialize(L"B{a1;i1}");
+      Product const one{1, ExprPtrList{a}, Product::Flatten::No};
+      Product const two{1, ExprPtrList{a, b}, Product::Flatten::No};
+
+      auto const one_result =
+          opt::apply_eval_sequence(one, EvalSequence{0});
+      REQUIRE(one_result->is<Product>());
+      REQUIRE(one_result->as<Product>().size() == 1);
+      REQUIRE(one_result->at(0) == a);
+
+      auto const two_result =
+          opt::apply_eval_sequence(two, EvalSequence{1, 0, -1});
+      REQUIRE(two_result->as<Product>().size() == 2);
+      REQUIRE(two_result->at(0) == b);
+      REQUIRE(two_result->at(1) == a);
+    }
+
+    SECTION("External evaluation sequence rejects malformed input") {
+      auto const prod =
+          parse_expr_antisymm(L"A{i1;a1} B{a1;i2} C{i2;i1}")
+              ->as<Product>();
+      REQUIRE_THROWS_AS(opt::apply_eval_sequence(prod, EvalSequence{0}),
+                        std::invalid_argument);
+      REQUIRE_THROWS_AS(
+          opt::apply_eval_sequence(prod, EvalSequence{0, 1, -1, 3, -1}),
+          std::invalid_argument);
+      REQUIRE_THROWS_AS(
+          opt::apply_eval_sequence(prod, EvalSequence{0, 0, -1, 2, -1}),
+          std::invalid_argument);
+      REQUIRE_THROWS_AS(
+          opt::apply_eval_sequence(prod, EvalSequence{-1, 0, 1, 2, -1}),
+          std::invalid_argument);
+      REQUIRE_THROWS_AS(
+          opt::apply_eval_sequence(prod, EvalSequence{-2, 0, 1, 2, -1}),
+          std::invalid_argument);
+    }
+
+    SECTION("External planner bypasses mixed products and propagates errors") {
+      auto const sum_factor =
+          parse_expr_antisymm(L"A{i1;a1} + B{i1;a1}");
+      auto const c = deserialize(L"C{a1;i2}");
+      auto const d = deserialize(L"D{i2;i1}");
+      auto const mixed = ex<Product>(Product{
+          1, ExprPtrList{sum_factor, c, d}, Product::Flatten::No});
+
+      bool called = false;
+      OptimizeOptions opts;
+      opts.single_term_planner =
+          [&](Product const&) -> std::optional<EvalSequence> {
+        called = true;
+        return EvalSequence{0, 1, -1, 2, -1};
+      };
+      REQUIRE_NOTHROW(optimize(mixed, opts));
+      REQUIRE_FALSE(called);
+
+      auto const pure =
+          parse_expr_antisymm(L"A{i1;a1} B{a1;i2} C{i2;i1}");
+      opts.single_term_planner =
+          [](Product const&) -> std::optional<EvalSequence> {
+        throw std::runtime_error("planner failure");
+      };
+      REQUIRE_THROWS_AS(optimize(pure, opts), std::runtime_error);
+    }
+
     SECTION("Parallel optimization of summands matches sequential") {
       // exercise optimize_impl(..., parallel_outer=true): a multi-summand sum
       // optimized concurrently must yield the same result as single-threaded.
@@ -365,6 +488,17 @@ TEST_CASE("optimize", "[optimize]") {
       auto const par = optimize(sum);
 
       REQUIRE(*seq == *par);
+
+      std::atomic_size_t callback_calls = 0;
+      OptimizeOptions opts;
+      opts.single_term_planner =
+          [&callback_calls](Product const&) -> std::optional<EvalSequence> {
+        ++callback_calls;
+        return std::nullopt;
+      };
+      auto const with_callback = optimize(sum, opts);
+      REQUIRE(*with_callback == *par);
+      REQUIRE(callback_calls == sum->as<Sum>().size());
     }
   }
 
