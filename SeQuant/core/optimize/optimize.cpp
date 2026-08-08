@@ -19,6 +19,7 @@
 #include <range/v3/view/iota.hpp>
 
 #include <cstddef>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -29,6 +30,36 @@ namespace {
 
 index_to_extent_t default_idx_to_size() {
   return [](Index const& ix) { return ix.space().approximate_size(); };
+}
+
+EvalSequence builtin_single_term_eval_sequence(Product const& prod,
+                                               OptimizeOptions opts) {
+  if (!opts.idx_to_extent) opts.idx_to_extent = default_idx_to_size();
+
+  container::svector<ExprPtr> tensors;
+  for (auto const& factor : prod) {
+    if (factor->is<Tensor>())
+      tensors.push_back(factor);
+    else if (!factor->is_scalar())
+      throw std::invalid_argument(
+          "single_term_eval_sequence requires a pure tensor product");
+  }
+  if (tensors.empty())
+    throw std::invalid_argument(
+        "single_term_eval_sequence requires at least one tensor factor");
+  if (tensors.size() == 1) return EvalSequence{0};
+  if (tensors.size() == 2) return EvalSequence{0, 1, -1};
+
+  bool const subnet_cse = opts.subnet_cse == SubnetCSE::Enable;
+  TensorNetwork network{tensors};
+  if (opts.opt_for == OptFor::Flops)
+    return opt::detail::single_term_opt<OptFor::Flops>(
+        network, opts.idx_to_extent, subnet_cse, opts.is_volatile_leaf,
+        opts.n_replay);
+  SEQUANT_ASSERT(opts.opt_for == OptFor::Memsize);
+  return opt::detail::single_term_opt<OptFor::Memsize>(
+      network, opts.idx_to_extent, subnet_cse, opts.is_volatile_leaf,
+      opts.n_replay);
 }
 
 /// Optimize a Product that contains only Tensor and scalar factors.
@@ -44,15 +75,8 @@ ExprPtr opt_pure_product(Product const& prod, OptimizeOptions const& opts) {
       if (auto sequence = opts.single_term_planner(prod); sequence)
         return opt::apply_eval_sequence(prod, *sequence);
   }
-  bool const subnet_cse = opts.subnet_cse == SubnetCSE::Enable;
-  if (opts.opt_for == OptFor::Flops)
-    return opt::single_term_opt<OptFor::Flops>(
-        prod, opts.idx_to_extent, subnet_cse, opts.is_volatile_leaf,
-        opts.n_replay);
-  SEQUANT_ASSERT(opts.opt_for == OptFor::Memsize);
-  return opt::single_term_opt<OptFor::Memsize>(
-      prod, opts.idx_to_extent, subnet_cse, opts.is_volatile_leaf,
-      opts.n_replay);
+  return opt::apply_eval_sequence(
+      prod, builtin_single_term_eval_sequence(prod, opts));
 }
 
 /// Deliberately non-identifier label prefix used to stand in for non-Tensor,
@@ -174,6 +198,12 @@ ExprPtr optimize_impl(ExprPtr const& expr, OptimizeOptions const& opts,
 }
 
 }  // namespace
+
+EvalSequence opt::single_term_eval_sequence(Product const& product,
+                                            OptimizeOptions opts) {
+  opts.single_term_planner = {};
+  return builtin_single_term_eval_sequence(product, std::move(opts));
+}
 
 ExprPtr optimize(ExprPtr const& expr, OptimizeOptions opts) {
   if (!opts.idx_to_extent) opts.idx_to_extent = default_idx_to_size();

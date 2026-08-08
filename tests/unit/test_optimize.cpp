@@ -374,6 +374,53 @@ TEST_CASE("optimize", "[optimize]") {
               *optimize(ex<Product>(prod)));
     }
 
+    SECTION("Built-in single-term sequence is externally reproducible") {
+      auto const product =
+          parse_expr_antisymm(L"1/4 A{i1;a1} B{a1;i2} C{i2;i1}")
+              ->as<Product>();
+      OptimizeOptions opts;
+      opts.idx_to_extent = [](Index const& index) {
+        return index.space().approximate_size();
+      };
+      opts.is_volatile_leaf =
+          [](Tensor const& tensor) { return tensor.label() == L"C"; };
+      opts.n_replay = 7;
+      opts.single_term_planner = [](Product const&) -> std::optional<EvalSequence> {
+        return EvalSequence{2, 1, -1, 0, -1};
+      };
+
+      auto const sequence = opt::single_term_eval_sequence(product, opts);
+      auto const replayed = opt::apply_eval_sequence(product, sequence);
+      opts.single_term_planner = {};
+      REQUIRE(*replayed == *optimize(ex<Product>(product), opts));
+
+      auto const one = deserialize(L"2 A{i1;a1}")->as<Product>();
+      auto const two =
+          deserialize(L"2 A{i1;a1} B{a1;i1}")->as<Product>();
+      REQUIRE(opt::single_term_eval_sequence(one) == EvalSequence{0});
+      REQUIRE(opt::single_term_eval_sequence(two) ==
+              EvalSequence{0, 1, -1});
+      REQUIRE(*opt::apply_eval_sequence(
+                  one, opt::single_term_eval_sequence(one)) ==
+              *optimize(ex<Product>(one)));
+      REQUIRE(*opt::apply_eval_sequence(
+                  two, opt::single_term_eval_sequence(two)) ==
+              *optimize(ex<Product>(two)));
+    }
+
+    SECTION("Built-in single-term sequence rejects mixed products") {
+      auto const sum_factor =
+          parse_expr_antisymm(L"A{i1;a1} + B{i1;a1}");
+      auto const tensor = deserialize(L"C{a1;i1}");
+      Product const mixed{1, ExprPtrList{sum_factor, tensor},
+                          Product::Flatten::No};
+      REQUIRE_THROWS_AS(opt::single_term_eval_sequence(mixed),
+                        std::invalid_argument);
+      Product const scalars_only{2, ExprPtrList{}, Product::Flatten::No};
+      REQUIRE_THROWS_AS(opt::single_term_eval_sequence(scalars_only),
+                        std::invalid_argument);
+    }
+
     SECTION("External evaluation sequence preserves factor identity") {
       auto const repeated =
           parse_expr_antisymm(L"A{i1;a1} A{i2;a2} B{a1,a2;i1,i2}")

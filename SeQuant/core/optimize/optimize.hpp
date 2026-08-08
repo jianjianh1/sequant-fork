@@ -6,6 +6,22 @@
 
 namespace sequant {
 
+class Product;
+
+namespace opt {
+
+/// Return the built-in optimizer's postfix sequence for one pure tensor
+/// product. Scalar factors do not consume ordinals. The external planner
+/// callback in @p opts is deliberately ignored so callers can capture a true
+/// SeQuant incumbent before asking another planner to choose a tree.
+///
+/// @throws std::invalid_argument if the product has no tensor factors or
+///         contains a non-tensor, non-scalar factor.
+EvalSequence single_term_eval_sequence(Product const& product,
+                                       OptimizeOptions opts = {});
+
+}  // namespace opt
+
 /// Optimize the expression for lower evaluation cost.
 ///
 /// \param expr  Expression to be optimized.
