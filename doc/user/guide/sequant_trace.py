@@ -3,8 +3,8 @@
 A trace is a stream of pipe-delimited lines emitted by the evaluator;
 each line is one of three kinds, identified by its first token:
 
-    Eval  | <mode> | <time> | [left=L | right=R |] result=X | alloc=A | hw=H | <label>
-    Cache | <mode> | key=K  | life=c/m | alive=N | entry=E | total=T | <label>
+    Eval  | <mode> | <time> | [left=L | right=R |] result=X | alloc=A | hw=H | key=K | <label>
+    Cache | <mode> | key=K  | life=c/m | alive=N | entry=E | total=T | lookup=Nns | <label>
     Term  | Begin  | <expr>
     Term  | End    | <expr>
 
@@ -35,8 +35,12 @@ from typing import NamedTuple
 _LINE_TAGS = frozenset({"Eval", "Cache", "Term"})
 _KV_RE = re.compile(r"^([A-Za-z_]+)=(.+)$")
 
-_EVAL_KNOWN_KEYS = frozenset({"result", "alloc", "hw", "left", "right"})
-_CACHE_KNOWN_KEYS = frozenset({"key", "life", "alive", "entry", "total"})
+_EVAL_KNOWN_KEYS = frozenset(
+    {"result", "alloc", "hw", "left", "right", "key"}
+)
+_CACHE_KNOWN_KEYS = frozenset(
+    {"key", "life", "alive", "entry", "total", "lookup"}
+)
 
 
 # ---------- row schemas ----------
@@ -49,6 +53,7 @@ class EvalRow(NamedTuple):
     hw: int
     left: "int | None"
     right: "int | None"
+    key: "int | None"
     label: str
     line: int
     extras: dict
@@ -62,6 +67,7 @@ class CacheRow(NamedTuple):
     alive: int
     entry: int
     total: int
+    lookup_ns: int
     label: str
     line: int
     extras: dict
@@ -127,6 +133,7 @@ def _parse_eval_row(lineno, fields):
         hw=_strip_suffix(kv["hw"], "B"),
         left=_strip_suffix(kv["left"], "B") if "left" in kv else None,
         right=_strip_suffix(kv["right"], "B") if "right" in kv else None,
+        key=int(kv["key"]) if "key" in kv else None,
         label=label,
         line=lineno,
         extras=extras,
@@ -147,6 +154,7 @@ def _parse_cache_row(lineno, fields):
         alive=int(kv["alive"]),
         entry=_strip_suffix(kv["entry"], "B"),
         total=_strip_suffix(kv["total"], "B"),
+        lookup_ns=_strip_suffix(kv.get("lookup", "0ns"), "ns"),
         label=label,
         line=lineno,
         extras=extras,

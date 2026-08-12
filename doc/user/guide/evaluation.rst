@@ -6,8 +6,8 @@ When the evaluator is built with ``SEQUANT_EVAL_TRACE``, it emits one
 log line per operation. A trace line is one of three kinds, identified
 by its first token:
 
-* ``Eval | <mode> | <time> | [left=L | right=R |] result=X | alloc=A | hw=H | <label>``
-* ``Cache | <mode> | key=K | life=c/m | alive=N | entry=E | total=T | <label>``
+* ``Eval | <mode> | <time> | [left=L | right=R |] result=X | alloc=A | hw=H | key=K | <label>``
+* ``Cache | <mode> | key=K | life=c/m | alive=N | entry=E | total=T | lookup=Nns | <label>``
 * ``Term | Begin | <expr>`` / ``Term | End | <expr>``
 
 The trace may be embedded in a larger log; the parsers in this guide
@@ -67,6 +67,11 @@ Each ``EvalRow`` has the fields:
     result + each operand not aliased to a cache entry.
 ``left`` / ``right``
     operand bytes, set only for ``Sum`` and ``Product``.
+``key``
+    structural evaluator hash for the node. MPQC native-graph exports carry
+    the same value as ``trace_key`` so measured operations can be joined to
+    planner features. It is omitted only for synthetic operations without an
+    EvalNode, such as ``SumInplace``.
 ``label``
     the operation's textual label.
 ``line``
@@ -174,6 +179,8 @@ Each ``CacheRow`` has the fields:
     bytes occupied by this entry (``0`` for a release).
 ``total``
     bytes occupied by all live entries combined.
+``lookup_ns``
+    nanoseconds spent in the cache lookup that produced this interaction.
 ``label``
     label of the node touching the cache.
 ``line``

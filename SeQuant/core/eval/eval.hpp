@@ -258,6 +258,7 @@ struct CacheStat {
   size_t num_alive;
   Bytes entry_memory;
   Bytes total_memory;
+  Duration lookup_time{};
 };
 
 template <typename Arg, typename... Args>
@@ -299,11 +300,13 @@ auto cache(CacheStat const& stat, Args const&... args) {
       std::format("alive={}", stat.num_alive),                   //
       std::format("entry={}", to_string(stat.entry_memory)),     //
       std::format("total={}", to_string(stat.total_memory)),     //
+      std::format("lookup={}ns", stat.lookup_time.count()),      //
       args...);
 }
 
 template <typename N, bool F, typename... Args>
-auto cache(N const& node, CacheManager<N, F>& cm, Args const&... args) {
+auto cache(N const& node, CacheManager<N, F>& cm, Duration lookup_time,
+           Args const&... args) {
   if (!printing()) return;  // skip the entry/total size walks and formatting
   using CacheMode::Access;
   using CacheMode::Release;
@@ -321,7 +324,8 @@ auto cache(N const& node, CacheManager<N, F>& cm, Args const&... args) {
                   .max_life = max_l,
                   .num_alive = cm.alive_count(),
                   .entry_memory = {cm.entry_size_in_bytes(node)},
-                  .total_memory = {bytes(cm)}},
+                  .total_memory = {bytes(cm)},
+                  .lookup_time = lookup_time},
         args...);
 }
 
@@ -523,14 +527,26 @@ ResultPtr evaluate(Node const& node,  //
                           .mem_result = log::bytes(post),
                           .mem_alloc = log::bytes(post),
                           .mem_hwmark = {cache.note_working_set(hwmark)}};
-        log::eval(stat, std::format("{} * {}", phase, node->label()));
+        log::eval(stat, std::format("key={}", hash::value(*node)),
+                  std::format("{} * {}", phase, node->label()));
       }
       return post;
     };
 
-    if (auto ptr = cache.access(node); ptr) {
+    ResultPtr ptr;
+    log::Duration lookup_time{};
+    if constexpr (detail::trace(EvalTrace)) {
+      if (log::printing())
+        lookup_time = detail::timed_eval_inplace(
+            [&]() { ptr = cache.access(node); });
+      else
+        ptr = cache.access(node);
+    } else {
+      ptr = cache.access(node);
+    }
+    if (ptr) {
       if constexpr (detail::trace(EvalTrace))
-        log::cache(node, cache, log::label(node));
+        log::cache(node, cache, lookup_time, log::label(node));
 
       return mult_by_phase(ptr);
     } else if (cache.exists(node)) {
@@ -539,7 +555,7 @@ ResultPtr evaluate(Node const& node,  //
           mult_by_phase(evaluate<EvalTrace, detail::CacheCheck::Unchecked>(
               node, le, cache)));
       if constexpr (detail::trace(EvalTrace))
-        log::cache(node, cache, log::label(node));
+        log::cache(node, cache, lookup_time, log::label(node));
 
       return mult_by_phase(ptr);
     } else {
@@ -571,6 +587,7 @@ ResultPtr evaluate(Node const& node,  //
                                   .mem_alloc = log::bytes(intercepted),
                                   .mem_hwmark = {cache.note_working_set(
                                       log::bytes(cache, intercepted).value)}},
+                    std::format("key={}", hash::value(*node)),
                     log::label(node));
         }
         return intercepted;
@@ -624,6 +641,7 @@ ResultPtr evaluate(Node const& node,  //
                               .mem_alloc = log::bytes(result),
                               .mem_hwmark = {cache.note_working_set(
                                   log::bytes(cache, result).value)}},
+                std::format("key={}", hash::value(*node)),
                 log::label(node));
     } else {
       // A cached child is *distinct* from the local left/right when its
@@ -646,6 +664,7 @@ ResultPtr evaluate(Node const& node,  //
                               .mem_hwmark = {cache.note_working_set(hwmark)},
                               .mem_left = log::bytes(left),
                               .mem_right = log::bytes(right)},
+                std::format("key={}", hash::value(*node)),
                 log::label(node));
     }
   }
@@ -710,7 +729,8 @@ ResultPtr evaluate(Node const& node,           //
                                 .mem_result = log::bytes(result.post),
                                 .mem_alloc = log::bytes(result.post),
                                 .mem_hwmark = {cache.note_working_set(hwmark)}};
-      log::eval(stat, node->label());
+      log::eval(stat, std::format("key={}", hash::value(*node)),
+                node->label());
     }
     log::term(log::TermMode::End, xpr);
   }
