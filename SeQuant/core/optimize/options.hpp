@@ -11,6 +11,7 @@ namespace sequant {
 
 class Index;
 class Product;
+class Sum;
 class Tensor;
 
 /// Optional caller-supplied planner for one pure tensor product. Returning a
@@ -19,6 +20,12 @@ class Tensor;
 /// concurrently for distinct summands and must therefore be thread-safe.
 using single_term_planner_t =
     std::function<std::optional<EvalSequence>(Product const&)>;
+
+/// Optional caller-supplied permutation for one optimized sum. Returning
+/// std::nullopt preserves the built-in reorder policy. The callback is invoked
+/// serially after all summands have been optimized.
+using sum_order_planner_t =
+    std::function<std::optional<container::vector<std::size_t>>(Sum const&)>;
 
 /// Cost metric to optimize for in single-term and top-level optimize routines.
 enum class OptFor { Flops, Memsize };
@@ -62,6 +69,10 @@ struct OptimizeOptions {
   /// scalar factors and use EvalSequence's postfix -1 contraction marker.
   /// Empty preserves the built-in optimizer. Mixed products bypass it.
   single_term_planner_t single_term_planner = {};
+
+  /// Optional external summand-order provider. The returned ordinals must be a
+  /// complete permutation of [0, sum.size()); invalid permutations throw.
+  sum_order_planner_t sum_order_planner = {};
 
   /// Marks a LEAF tensor as volatile: its value changes between replays of the
   /// network, so any contraction depending on it is re-evaluated on every

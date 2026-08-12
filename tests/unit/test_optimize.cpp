@@ -374,6 +374,45 @@ TEST_CASE("optimize", "[optimize]") {
               *optimize(ex<Product>(prod)));
     }
 
+    SECTION("OptimizeOptions: external sum-order planner") {
+      auto const sum = parse_expr_antisymm(
+          L"A{i1;a1} B{a1;i2} + C{i1;a1} D{a1;i2} + E{i1;a1} F{a1;i2}");
+      REQUIRE(sum->is<Sum>());
+      bool called = false;
+      OptimizeOptions opts{.reorder = ReorderSum::NoReorder};
+      opts.sum_order_planner =
+          [&](Sum const& seen)
+          -> std::optional<container::vector<std::size_t>> {
+        called = true;
+        REQUIRE(seen.size() == 3);
+        return container::vector<std::size_t>{2, 0, 1};
+      };
+      auto const result = optimize(sum, opts);
+      REQUIRE(called);
+      REQUIRE(result->is<Sum>());
+      auto const& original = sum->as<Sum>();
+      auto const& ordered = result->as<Sum>();
+      for (auto const [output, input] :
+           std::initializer_list<std::pair<std::size_t, std::size_t>>{
+               {0, 2}, {1, 0}, {2, 1}}) {
+        auto expected = optimize(
+            original.summand(input),
+            OptimizeOptions{.reorder = ReorderSum::NoReorder});
+        REQUIRE(*ordered.summand(output) == *expected);
+      }
+
+      opts.sum_order_planner =
+          [](Sum const&) -> std::optional<container::vector<std::size_t>> {
+        return container::vector<std::size_t>{0, 0, 2};
+      };
+      REQUIRE_THROWS_AS(optimize(sum, opts), std::invalid_argument);
+      opts.sum_order_planner =
+          [](Sum const&) -> std::optional<container::vector<std::size_t>> {
+        return container::vector<std::size_t>{0, 1};
+      };
+      REQUIRE_THROWS_AS(optimize(sum, opts), std::invalid_argument);
+    }
+
     SECTION("Built-in single-term sequence is externally reproducible") {
       auto const product =
           parse_expr_antisymm(L"1/4 A{i1;a1} B{a1;i2} C{i2;i1}")

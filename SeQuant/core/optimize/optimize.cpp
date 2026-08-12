@@ -180,6 +180,23 @@ ExprPtr optimize_impl(ExprPtr const& expr, OptimizeOptions const& opts,
     }
 
     Sum new_sum(std::move(new_smands), Sum::move_only_tag{});
+    if (opts.sum_order_planner) {
+      if (auto permutation = opts.sum_order_planner(new_sum); permutation) {
+        if (permutation->size() != new_sum.size())
+          throw std::invalid_argument(
+              "sum-order planner returned a permutation of the wrong size");
+        container::vector<bool> seen(new_sum.size(), false);
+        Sum ordered;
+        for (auto ordinal : *permutation) {
+          if (ordinal >= new_sum.size() || seen[ordinal])
+            throw std::invalid_argument(
+                "sum-order planner returned an invalid permutation");
+          seen[ordinal] = true;
+          ordered.append(new_sum.at(ordinal));
+        }
+        return ex<Sum>(std::move(ordered));
+      }
+    }
     if (!reorder) return ex<Sum>(std::move(new_sum));
 
     // Binarize once per optimized summand and hand the nodes to reorder()
@@ -202,6 +219,7 @@ ExprPtr optimize_impl(ExprPtr const& expr, OptimizeOptions const& opts,
 EvalSequence opt::single_term_eval_sequence(Product const& product,
                                             OptimizeOptions opts) {
   opts.single_term_planner = {};
+  opts.sum_order_planner = {};
   return builtin_single_term_eval_sequence(product, std::move(opts));
 }
 
