@@ -12,6 +12,9 @@
 
 #include <range/v3/view/iota.hpp>
 
+#include <cmath>
+#include <optional>
+
 namespace sequant {
 
 // implementation details of the TiledArray result backend; prefer
@@ -457,6 +460,45 @@ class ResultTensorTA final : public Result {
     v.world().gop.sum(local_size);
     return local_size;
   }
+
+  // Flat (non-nested) array: one pass over each local stored tile's
+  // elements. Mirrors the accumulation ta-bench/src/ta_dumper.h's
+  // ta_compute_checksum() independently implements for the standalone
+  // TiledArray reproduction this sanity-checks against.
+  //
+  // Real-double arrays only: ResultTensorTA is also instantiated for
+  // std::complex<double> (EOM-CC / periodic code paths), where `double
+  // local_sum += v` doesn't compile. Rather than generalize Checksum to
+  // carry complex sums (not needed for this real-valued PNO-CCSD sanity
+  // check), fall back to the Result base's default (nullopt) for any
+  // other numeric_type — mirrors the slice_mode/adjoint "not every
+  // instantiation needs this" precedent elsewhere in this file.
+  [[nodiscard]] std::optional<Result::Checksum> checksum() const override {
+    if constexpr (!std::is_same_v<numeric_type, double>) {
+      return std::nullopt;
+    } else {
+      auto const& arr = get<ArrayT>();
+      int64_t local_nnz = 0;
+      double local_sum = 0.0, local_sumsq = 0.0, local_max = 0.0;
+      for (auto it = arr.begin(); it != arr.end(); ++it) {
+        auto const& tile = it->get();
+        for (auto v : tile) {
+          if (v == 0.0) continue;
+          ++local_nnz;
+          local_sum += v;
+          local_sumsq += v * v;
+          double const av = std::abs(v);
+          if (av > local_max) local_max = av;
+        }
+      }
+      Result::Checksum cs{local_nnz, local_sum, local_sumsq, local_max};
+      arr.world().gop.sum(cs.nnz);
+      arr.world().gop.sum(cs.sum);
+      arr.world().gop.sum(cs.sumsq);
+      arr.world().gop.max(cs.max_abs);
+      return cs;
+    }
+  }
 };
 
 template <typename ArrayT,
@@ -472,8 +514,6 @@ class ResultTensorOfTensorTA final : public Result {
  private:
   using this_type = ResultTensorOfTensorTA<ArrayT>;
   using annot_wrap = Annot<std::string>;
-
-  using _inner_tensor_type = typename ArrayT::value_type::value_type;
 
   // "Regular" (non-nested) companion array for ToT * T einsum. The OUTER tile
   // type must be a TA::Tensor — inner tile types like btas::Tensor are only
@@ -676,6 +716,51 @@ class ResultTensorOfTensorTA final : public Result {
     auto local_size = TA::size_of<TA::MemorySpace::Host>(v);
     v.world().gop.sum(local_size);
     return local_size;
+  }
+
+  // Tensor-of-tensor: each local outer tile holds one inner tensor per
+  // outer element; walk both levels. Mirrors the accumulation
+  // ta-bench/src/ta_dumper.h's ta_accumulate_local_tot() independently
+  // implements for the standalone TiledArray reproduction this
+  // sanity-checks against.
+  //
+  // Real-double inner tensor only (see ResultTensorTA::checksum() for
+  // the complex<double> numeric_type case). Use data()/size() rather
+  // than begin()/end() to walk the inner tensor's elements: both
+  // TA::Tensor and TA::ArenaTensor (the two inner tile types SeQuant
+  // uses) provide data()/size(), but ArenaTensor has no begin()/end()
+  // at all.
+  [[nodiscard]] std::optional<Result::Checksum> checksum() const override {
+    if constexpr (!std::is_same_v<numeric_type, double>) {
+      return std::nullopt;
+    } else {
+      auto const& arr = get<ArrayT>();
+      int64_t local_nnz = 0;
+      double local_sum = 0.0, local_sumsq = 0.0, local_max = 0.0;
+      for (auto it = arr.begin(); it != arr.end(); ++it) {
+        auto const& outer_tile = it->get();
+        for (auto const& inner : outer_tile) {
+          if (inner.empty()) continue;
+          auto const* data = inner.data();
+          auto const n = inner.size();
+          for (std::size_t i = 0; i < n; ++i) {
+            auto const v = data[i];
+            if (v == 0.0) continue;
+            ++local_nnz;
+            local_sum += v;
+            local_sumsq += v * v;
+            double const av = std::abs(v);
+            if (av > local_max) local_max = av;
+          }
+        }
+      }
+      Result::Checksum cs{local_nnz, local_sum, local_sumsq, local_max};
+      arr.world().gop.sum(cs.nnz);
+      arr.world().gop.sum(cs.sum);
+      arr.world().gop.sum(cs.sumsq);
+      arr.world().gop.max(cs.max_abs);
+      return cs;
+    }
   }
 };
 

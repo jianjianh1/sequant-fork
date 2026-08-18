@@ -17,6 +17,7 @@
 #include <SeQuant/core/index_space_registry.hpp>
 #include <SeQuant/core/io/serialization/serialization.hpp>
 #include <SeQuant/core/io/shorthands.hpp>
+#include <SeQuant/core/optimize/common_subexpression_elimination.hpp>
 #include <SeQuant/core/optimize/optimize.hpp>
 #include <SeQuant/core/rational.hpp>
 #include <SeQuant/core/utility/indices.hpp>
@@ -34,16 +35,229 @@
 #include <range/v3/view/tail.hpp>
 #include <range/v3/view/transform.hpp>
 
+#include <algorithm>
 #include <cassert>
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <regex>
 #include <set>
 #include <sstream>
+#include <unordered_map>
 
 using namespace sequant;
 
 namespace {
+
+// Phase O follow-up (2026-07-22, T2 deadlock root-cause fix):
+// opt::eliminate_common_subexpressions()'s SubexpressionReplacer builds
+// each OCCURRENCE's own reference from THAT occurrence's local
+// canon_indices() (sorted only by index space) -- it does not carry over
+// the actual bliss graph-isomorphism permutation found between the
+// defining occurrence and a later, structurally-equal-but-axis-permuted
+// occurrence. For a hoisted tensor with >=2 same-space indices where such
+// a permutation exists, this can silently reference the SAME physical
+// array with a TRANSPOSED axis order at different call sites -- confirmed
+// by direct inspection of the generated T2 code: CSE17_i_i_i_i was
+// defined and correctly referenced twice as ("i_3,i_4,i_1,i_2"), but
+// referenced a THIRD time as ("i_3,i_4,i_2,i_1") -- the exact same four
+// dummy-index tokens, just the last two positions swapped -- not a
+// relabeling (a relabeling would use different token numbers), a genuine
+// mislabeled axis order. This plausibly explains the observed MADNESS
+// deadlock (a corrupted SparseShape/tile-dependency expectation from the
+// mismatched axis order: a task gets scheduled expecting data in a tile
+// combination that, under the real, untransposed sparsity pattern, is
+// never produced).
+//
+// Fix: canonicalize every CSEn tensor's occurrences to its FIRST
+// (defining) occurrence's annotation, whenever a later occurrence's
+// annotation is a pure permutation of the exact same token set in a
+// different order (a genuinely different token set, e.g. a differently-
+// numbered contracted/free dummy index at a different call site, is left
+// untouched -- that's normal, not a bug; verified separately that only
+// token-set-identical, order-differing cases exist in the current output).
+std::string fix_cse_axis_order(const std::string& code) {
+  static const std::regex occ_re(R"(\b(CSE\d+[A-Za-z_μ̃Κ]*)\(\"([^\"]*)\"\))");
+
+  std::unordered_map<std::string, std::string> canonical;
+  for (auto it = std::sregex_iterator(code.begin(), code.end(), occ_re);
+       it != std::sregex_iterator(); ++it) {
+    const std::string& name = (*it)[1].str();
+    if (!canonical.count(name)) canonical[name] = (*it)[2].str();
+  }
+
+  auto sorted_tokens = [](const std::string& ann) {
+    std::vector<std::string> toks;
+    std::stringstream ss(ann);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) toks.push_back(tok);
+    std::sort(toks.begin(), toks.end());
+    return toks;
+  };
+
+  std::string result;
+  std::size_t last_pos = 0;
+  int fixes = 0;
+  for (auto it = std::sregex_iterator(code.begin(), code.end(), occ_re);
+       it != std::sregex_iterator(); ++it) {
+    const std::smatch& m = *it;
+    const std::string& name = m[1].str();
+    const std::string& ann = m[2].str();
+    result += code.substr(last_pos, m.position() - last_pos);
+    auto found = canonical.find(name);
+    if (found != canonical.end() && ann != found->second &&
+        sorted_tokens(ann) == sorted_tokens(found->second)) {
+      result += name + "(\"" + found->second + "\")";
+      ++fixes;
+    } else {
+      result += m.str();
+    }
+    last_pos = static_cast<std::size_t>(m.position() + m.length());
+  }
+  result += code.substr(last_pos);
+
+  if (fixes > 0) {
+    std::cout << "  [fix_cse_axis_order] fixed " << fixes
+              << " mislabeled CSE-tensor axis-order occurrence(s)\n";
+  }
+  return result;
+}
+
+// Phase O third follow-up (2026-07-22): fixes a SECOND, more severe
+// generator bug found by bisecting T2's cross-term-CSE deadlock down to
+// its minimal reproducing case (N=46 of 55 summands) and scanning the
+// resulting code: a local C++ variable can get `+=`'d with a genuinely
+// DIFFERENT outer rank than it was last written with, with no release in
+// between -- e.g. `I_i_i_ap2_ap2` used as a rank-2 accumulator (its own
+// final return value) throughout most of a function, but at one point
+// `+=`'d with a rank-4 annotation. This is `eliminate_common_
+// subexpressions`'s tree restructuring producing two genuinely
+// different-rank SeQuant nodes that collide onto the same exported C++
+// name (the export framework's own dedup, `TensorBlockLessThanComparator`,
+// groups by label+slot/space signature, not full rank) -- confirmed via a
+// dedicated scanner that this exact pattern appears ONLY in the failing
+// generated code and never in working output. A rank-mismatched `+=` on a
+// ToT array in a Release build (no shape assertion) plausibly corrupts
+// internal SparseShape/tile-dependency bookkeeping, and because the
+// corruption's actual failure mode depends on thread interleaving, the
+// observed symptom (non-deterministic hang across identical reruns of the
+// SAME generated code) is consistent with this being the root cause.
+//
+// Fix: scan for each `+=` whose outer rank differs from that name's
+// last-tracked rank (from a PRIOR write with no release in between) --
+// this is impossible for a legitimate accumulation, so treat every such
+// span (from the colliding write to its closing release) as a genuinely
+// SEPARATE local variable and rename it, isolating it completely from the
+// name's other, correct uses. Verified end-to-end (5+ repeated real-data
+// runs, no hangs, correct checksums matching the known-correct value)
+// against a Python prototype before porting here.
+std::string fix_rank_collision(const std::string& code) {
+  std::vector<std::string> lines;
+  {
+    std::stringstream ss(code);
+    std::string line;
+    while (std::getline(ss, line)) lines.push_back(line);
+  }
+
+  static const std::regex decl_re(
+      R"(^(\s*)(TA::TSpArrayD|TA::DistArray<[^;]+>)\s+([A-Za-z_][\w μ̃Κ]*);\s*$)");
+  std::unordered_map<std::string, std::string> decl_type;
+  std::unordered_map<std::string, std::size_t> decl_line_idx;
+  for (std::size_t i = 0; i < lines.size(); ++i) {
+    std::smatch m;
+    if (std::regex_match(lines[i], m, decl_re)) {
+      decl_type[m[3].str()] = m[2].str();
+      decl_line_idx[m[3].str()] = i;
+    }
+  }
+
+  static const std::regex write_re(
+      R"(^(\s*)([A-Za-z_][\w μ̃Κ]*)\(\"([^\"]*)\"\)\s*(\+?=))");
+  static const std::regex release_re(
+      R"(^(\s*)([A-Za-z_][\w μ̃Κ]*) = (.+\(\));\s*//\s*release\s*$)");
+
+  auto outer_rank = [](const std::string& ann) -> int {
+    std::string outer = ann.substr(0, ann.find(';'));
+    if (outer.empty()) return 0;
+    int n = 1;
+    for (char c : outer) if (c == ',') ++n;
+    return n;
+  };
+
+  std::unordered_map<std::string, int> current_rank;   // -1 == unwritten/released
+  std::unordered_map<std::string, std::size_t> open_start;  // name -> collision start line
+  struct Collision { std::size_t start, end; std::string name; };
+  std::vector<Collision> collisions;
+
+  for (std::size_t i = 0; i < lines.size(); ++i) {
+    std::smatch rm;
+    if (std::regex_match(lines[i], rm, release_re)) {
+      const std::string& name = rm[2].str();
+      auto oit = open_start.find(name);
+      if (oit != open_start.end()) {
+        collisions.push_back({oit->second, i, name});
+        open_start.erase(oit);
+      }
+      current_rank[name] = -1;
+      continue;
+    }
+    std::smatch wm;
+    if (!std::regex_search(lines[i], wm, write_re)) continue;
+    const std::string name = wm[2].str();
+    const std::string ann = wm[3].str();
+    const std::string op = wm[4].str();
+    int rank = outer_rank(ann);
+    if (open_start.count(name)) continue;  // already inside a collision span
+    auto cit = current_rank.find(name);
+    bool has_prior = cit != current_rank.end() && cit->second != -1;
+    if (op == "+=" && has_prior && cit->second != rank) {
+      open_start[name] = i;
+    }
+    current_rank[name] = rank;
+  }
+
+  for (const auto& [name, start] : open_start) {
+    std::cout << "  [fix_rank_collision] WARNING: collision for " << name
+              << " at statement " << (start + 1)
+              << " never closes (no later release found) -- NOT fixed\n";
+  }
+
+  if (collisions.empty()) return code;
+
+  std::vector<std::string> new_decls;
+  int n = 0;
+  for (const auto& c : collisions) {
+    ++n;
+    const std::string fresh = c.name + "_RANKFIX" + std::to_string(n);
+    std::string type = "TA::TSpArrayD";
+    if (auto it = decl_type.find(c.name); it != decl_type.end()) type = it->second;
+    new_decls.push_back("  " + type + " " + fresh + ";");
+
+    std::regex paren_re(R"(\b)" + c.name + R"(\()");
+    for (std::size_t i = c.start; i <= c.end; ++i) {
+      lines[i] = std::regex_replace(lines[i], paren_re, fresh + "(");
+    }
+    // Closing release line has no paren -- handle the bare-name form.
+    std::regex bare_re(R"(\b)" + c.name + R"(\b(?!\())");
+    lines[c.end] = std::regex_replace(lines[c.end], bare_re, fresh,
+                                      std::regex_constants::format_first_only);
+    // The collision's first write must be `=` (fresh var, never written).
+    lines[c.start] =
+        std::regex_replace(lines[c.start], std::regex(R"(\)\s*\+=)"), ") =",
+                           std::regex_constants::format_first_only);
+    std::cout << "  [fix_rank_collision] renamed span [" << (c.start + 1)
+              << "," << (c.end + 1) << "]: " << c.name << " -> " << fresh
+              << "\n";
+  }
+
+  std::size_t last_decl_line = 0;
+  for (const auto& [name, idx] : decl_line_idx) last_decl_line = std::max(last_decl_line, idx);
+  for (const auto& d : new_decls) lines[last_decl_line] += "\n" + d;
+
+  std::string result;
+  for (const auto& l : lines) { result += l; result += "\n"; }
+  return result;
+}
 
 // Copied/adapted from mpqc4:src/mpqc/math/external/sequant/sequant.cpp's
 // detail::make_sr_spaces() + load_convention().
@@ -321,14 +535,159 @@ int main() {
     for (auto &&ix : eq_external) std::wcout << ix.label() << L" ";
     std::wcout << L"\n";
 
-    auto tree = to_export_tree(e, /*retain_braket=*/false, eq_external);
+    // Phase O (2026-07-22, performance-parity investigation): optimize()
+    // only CSEs WITHIN one top-level Sum term (core/optimize/optimize.cpp
+    // processes each summand independently, explicitly parallelized with
+    // no cross-term shared state) -- it never detects that a structurally
+    // identical subexpression recurs across DIFFERENT top-level terms
+    // under a different dummy-index gensym. Confirmed empirically (see
+    // ~/.claude/jobs/*/tmp/dedup_check.py): 65-72% of the statements this
+    // pipeline previously generated were exact duplicates (modulo
+    // consistent dummy-index renaming) of a computation already done
+    // elsewhere in the same file. Real MPQC's own runtime evaluator avoids
+    // this via a cross-term CacheManager (cck.ipp:1679-1692,
+    // cache_manager(nodes, L"t", min_repeats=2)); this block is SeQuant's
+    // own static equivalent (opt::eliminate_common_subexpressions(),
+    // previously unused anywhere in the tree -- confirmed via
+    // `grep -rl eliminate_common_subexpressions`). AcceptAllPredicate
+    // (the default filter) is safe here because our benchmark evaluates
+    // the whole residual ONCE against fixed leaf data -- unlike MPQC's
+    // real iterative solve, there's no "amplitude changes every
+    // iteration" staleness concern to gate on.
+    //
+    // Build the per-summand export forest -- same to_export_tree() call
+    // and same `summands`/`eq_external` the pre-existing per-summand
+    // cross-check loop below already uses -- then run cross-term CSE on
+    // it before exporting, instead of exporting the whole-Sum tree
+    // directly (which never shared anything across summands to begin
+    // with).
+    // SAFETY (2026-07-22): T1's cross-term-CSE output verified correct
+    // (checksum matches the known-correct value exactly). T2's, however,
+    // triggers a real, NON-DETERMINISTIC MADNESS/TiledArray deadlock
+    // ("Hung queue?" / "0 of 2401 tiles set" internally, or an external
+    // wall-clock hang) -- confirmed via bisection (SPTC_CSE_BISECT_N
+    // below) that it reproduces reliably at N>=46 of T2's 55 summands and
+    // never at N<=45, and via repeated identical reruns that the SAME
+    // generated code sometimes completes correctly and sometimes hangs
+    // (ruling out a simple deterministic logic bug in favor of a genuine
+    // runtime race).
+    //
+    // TWO real, distinct bugs found via direct inspection of the generated
+    // code (not guessing), both upstream of our own generator/export
+    // pipeline:
+    // 1. eliminate_common_subexpressions()'s SubexpressionReplacer built
+    //    each occurrence's reference from THAT occurrence's own local
+    //    canon_indices() (sorted only by index space), without correcting
+    //    for a same-space-index permutation a bliss graph-isomorphism can
+    //    equate as "the same" subexpression -- confirmed in T2's output
+    //    (CSE17_i_i_i_i referenced with a transposed axis order at one
+    //    call site: same 4 dummy tokens, last two positions swapped).
+    //    Fixed via fix_cse_axis_order() above (canonicalizes any CSEn
+    //    tensor's occurrences to its defining occurrence's annotation
+    //    whenever a later one is a pure permutation of the same token
+    //    set). Necessary, but NOT sufficient on its own to unblock T2.
+    // 2. THE LIKELY ROOT CAUSE of the actual deadlock: a C++-variable-NAME
+    //    COLLISION ACROSS GENUINELY DIFFERENT RANKS. Found by bisecting to
+    //    the minimal N=46 case and scanning its generated code: the local
+    //    variable `I_i_i_ap2_ap2` is used as a rank-2-outer ToT array
+    //    (annotation "i_1,i_2;a_1,a_2") throughout MOST of the function
+    //    (including as the function's own return value), but at ONE point
+    //    gets `+=`'d with a RANK-4-outer annotation
+    //    ("i_1,i_2,i_3,i_4;a_3,a_4") with NO release/reset in between --
+    //    i.e. the exact same C++ object accumulates two shape-incompatible
+    //    einsum results. Confirmed via a dedicated scanner
+    //    (check_rank_collision.py) that this exact pattern is present ONLY
+    //    in the N>=46 generated code and absent from N<=45 and from T1's
+    //    (working) CSE output -- a precise, reproducible correlation with
+    //    the bisected failure boundary. Root cause: the export framework's
+    //    C++-variable naming/dedup scheme groups intermediates by a family
+    //    SIGNATURE (label + slot/space shape) that `eliminate_common_
+    //    subexpressions`'s tree restructuring can apparently violate --
+    //    two genuinely different-rank SeQuant nodes ending up mapped to
+    //    the same exported name without an intervening reset. This is
+    //    consistent with the observed NON-DETERMINISM: a rank-mismatched
+    //    `+=` on a ToT DistArray in a Release build (no shape assertion)
+    //    plausibly corrupts SparseShape/tile-dependency bookkeeping in a
+    //    way whose exact failure mode (silent-but-wrong vs. deadlock)
+    //    depends on thread interleaving, not just the code itself.
+    //    **FIXED** (2026-07-22, third follow-up) via `fix_rank_collision()`
+    //    below -- detects any `+=` whose outer rank differs from that
+    //    name's last-tracked rank (impossible for a legitimate
+    //    accumulation) and isolates the whole colliding span into a
+    //    freshly-named, dedicated variable. Verified via 5+ repeated
+    //    real-data runs: zero hangs, checksums matching the known-correct
+    //    value every time -- CSE is now enabled for BOTH T1 and T2.
+    //
+    // Bisection knob (kept as a reusable diagnostic tool): SPTC_CSE_BISECT_N,
+    // if set and r==2, runs cross-term CSE on only the FIRST N of T2's 55
+    // summands (the rest export individually, un-deduped but still
+    // correct) -- this is exactly how bug 2 above was isolated to its
+    // minimal N=46 reproducing case, which led directly to the fix above.
+    bool use_cross_term_cse = true;
+    int cse_bisect_n = -1;
+    if (r == 2) {
+      if (const char* v = std::getenv("SPTC_CSE_BISECT_N")) {
+        cse_bisect_n = std::atoi(v);
+        use_cross_term_cse = true;
+      }
+    }
+    container::svector<ExportNode<ExportExpr>> forest;
+    if (use_cross_term_cse && e->is<Sum>()) {
+      const auto &cse_summands = e->as<Sum>().summands();
+      std::size_t n_cse = cse_bisect_n >= 0
+                               ? std::min<std::size_t>(cse_bisect_n, cse_summands.size())
+                               : cse_summands.size();
+      if (cse_bisect_n >= 0) {
+        std::cout << "  [bisect] CSE-ing first " << n_cse << "/"
+                  << cse_summands.size() << " summands\n";
+      }
+      container::svector<ExportNode<ExportExpr>> cse_forest;
+      cse_forest.reserve(n_cse);
+      for (std::size_t i = 0; i < n_cse; ++i) {
+        cse_forest.push_back(
+            to_export_tree(cse_summands[i], /*retain_braket=*/false, eq_external));
+      }
+      auto expr_to_tree = [&](const auto &x) -> ExportNode<ExportExpr> {
+        if constexpr (std::is_same_v<std::remove_cvref_t<decltype(x)>,
+                                     ExprPtr>) {
+          return to_export_tree<ExportExpr>(x, /*retain_braket=*/false,
+                                            eq_external);
+        } else {
+          return to_export_tree<ExportExpr>(x, /*retain_braket=*/false);
+        }
+      };
+      // NOTE: eliminate_common_subexpressions() is single-pass by design --
+      // it only detects duplicates present in the ORIGINAL trees, so a
+      // duplicate that only becomes apparent after an earlier round's
+      // hoisting isn't caught in one call. Tried iterating this to a fixed
+      // point: T2's forest converges cleanly (55->121 trees over 5 passes,
+      // stable after), but T1's grows by a steady +2 trees/pass with no
+      // sign of convergence even after 50 passes -- behavior this
+      // single-call API wasn't designed/verified for, and not something
+      // this investigation chased down further. Sticking to the single,
+      // well-understood call the approved plan scoped.
+      sequant::opt::eliminate_common_subexpressions(cse_forest, expr_to_tree);
+      forest = std::move(cse_forest);
+      // Remaining summands (bisection only): export individually,
+      // un-deduped -- still correct, just not shared.
+      for (std::size_t i = n_cse; i < cse_summands.size(); ++i) {
+        forest.push_back(
+            to_export_tree(cse_summands[i], /*retain_braket=*/false, eq_external));
+      }
+    } else {
+      forest.push_back(to_export_tree(e, /*retain_braket=*/false, eq_external));
+    }
     TiledArrayGenerator generator;
     TiledArrayGeneratorContext ctx;
     std::string fn_name = "whole_t" + std::to_string(r) + "_residual";
     try {
-      export_group(ExpressionGroup<ExportExpr>{std::move(tree), fn_name},
+      export_group(ExpressionGroup<ExportExpr>{std::move(forest), fn_name},
                   generator, ctx);
       std::string code = generator.get_generated_code();
+      if (use_cross_term_cse) {
+        code = fix_cse_axis_order(code);
+        code = fix_rank_collision(code);
+      }
       std::cout << "Generated " << code.size() << " chars of C++.\n";
       std::string path =
           "/tmp/claude-ta-generator-test/generated_R" + std::to_string(r) + ".cpp";

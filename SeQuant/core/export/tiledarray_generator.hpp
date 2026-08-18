@@ -290,6 +290,29 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
   void unload(const Tensor &tensor, const Context &ctx) override {
     const std::string name = represent(tensor, ctx);
     if (m_leaf_names.count(name)) return;  // never release a parameter
+    // Phase O (2026-07-22, performance-parity investigation): a tensor
+    // hoisted by opt::eliminate_common_subexpressions() (labeled "CSE1",
+    // "CSE2", ... by its label_gen) is referenced from MULTIPLE, separate
+    // top-level ExportNode trees within the SAME ExpressionGroup -- but
+    // export_expression() (core/export/export.hpp) constructs a FRESH
+    // GenerationVisitor (and thus a fresh, per-tree m_tensorUses ref-count)
+    // for EACH tree in the group, with no cross-tree visibility. That
+    // means the ref-count correctly reaches 0 (and unload() fires) as soon
+    // as the CURRENT tree's own local uses are exhausted -- even though a
+    // LATER, separate tree in the same group still needs this value.
+    // Confirmed via real generated output: a CSE-hoisted "CSE2_Κ" was
+    // released after its first use, then referenced again by two later,
+    // independent top-level statements -- silently reading a
+    // default-constructed (empty) array instead of the real computed
+    // value. Since every CSE{n} name is, by construction of
+    // SubexpressionReplacer's name_counter, written exactly ONCE for the
+    // whole function's lifetime (never reused for a different value the
+    // way ordinary synthesized "I"/"I2"-style intermediates are), simply
+    // never releasing it is correct and safe -- it just stays allocated
+    // for the rest of the function, a small, bounded memory cost (at most
+    // one array per distinct hoisted subexpression) in exchange for
+    // correctness.
+    if (tensor.label().rfind(L"CSE", 0) == 0) return;
     const std::string type = tensor_cpp_type(tensor);
     m_body += m_indent + name + " = " + type + "();  // release\n";
     // BUG FIX (2026-07-19, Phase 5 real-data crash investigation,
@@ -586,7 +609,7 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
   /// only <tiledarray.h> -- matching this generator's "self-contained
   /// function" design (see file header).
   static constexpr const char *kArrayToTType =
-      "TA::DistArray<TA::Tensor<TA::Tensor<double>>, TA::SparsePolicy>";
+      "TA::DistArray<TA::Tensor<TA::ArenaTensor<double>>, TA::SparsePolicy>";
 
   static std::string tensor_cpp_type(const Tensor &tensor) {
     return is_tot_tensor(tensor) ? kArrayToTType : "TA::TSpArrayD";

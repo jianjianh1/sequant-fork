@@ -617,6 +617,20 @@ ResultPtr evaluate(Node const& node,  //
 
   // logging
   if constexpr (detail::trace(EvalTrace)) {
+    // result->checksum() walks every stored element — real cost, unlike the
+    // O(1) bytes()/size_in_bytes() metadata above — so only pay it when a
+    // trace line will actually be emitted (log::printing() is the runtime
+    // "is the logger level > 0" check log::eval() itself uses to
+    // short-circuit). Appended as one extra trailing token so the existing
+    // `Eval | ... | <label>` line shape doesn't change; a checksum-unaware
+    // downstream parser just sees one more field before the label.
+    std::string const checksum_s = [&]() -> std::string {
+      if (!log::printing()) return "checksum=NA";
+      if (auto cs = result->checksum())
+        return std::format("checksum={},{:.17g},{:.17g},{:.17g}", cs->nnz,
+                           cs->sum, cs->sumsq, cs->max_abs);
+      return "checksum=NA";
+    }();
     if (node.leaf()) {
       log::eval(log::EvalStat{.mode = log::eval_mode(node),
                               .time = time,
@@ -624,7 +638,7 @@ ResultPtr evaluate(Node const& node,  //
                               .mem_alloc = log::bytes(result),
                               .mem_hwmark = {cache.note_working_set(
                                   log::bytes(cache, result).value)}},
-                log::label(node));
+                checksum_s, log::label(node));
     } else {
       // A cached child is *distinct* from the local left/right when its
       // canon_phase != 1, because mult_by_phase allocates a fresh buffer
@@ -646,7 +660,7 @@ ResultPtr evaluate(Node const& node,  //
                               .mem_hwmark = {cache.note_working_set(hwmark)},
                               .mem_left = log::bytes(left),
                               .mem_right = log::bytes(right)},
-                log::label(node));
+                checksum_s, log::label(node));
     }
   }
 

@@ -19,6 +19,7 @@
 #include <any>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -372,6 +373,26 @@ class Result {
 
   /// @return the size of the object in bytes
   [[nodiscard]] virtual std::size_t size_in_bytes() const = 0;
+
+  /// \brief A cheap, order-independent correctness/sanity-check summary of
+  ///        this result's numeric content: number of stored (non-strict-zero)
+  ///        elements, their sum, sum-of-squares, and max absolute value.
+  ///
+  /// Not a pure virtual: only tensor-backed results with an accessible
+  /// numeric value need it (mirrors the slice_mode/adjoint precedent above).
+  /// The default returns nullopt so every other Result subtype (e.g. scalar
+  /// results) needs no changes. Only meaningful when SEQUANT_EVAL_TRACE is
+  /// on and a trace line is actually being emitted for this eval op — see
+  /// eval.hpp's evaluate().
+  struct Checksum {
+    int64_t nnz = 0;
+    double sum = 0.0;
+    double sumsq = 0.0;
+    double max_abs = 0.0;
+  };
+  [[nodiscard]] virtual std::optional<Checksum> checksum() const {
+    return std::nullopt;
+  }
 
  protected:
   template <typename T,
