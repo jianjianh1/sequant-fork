@@ -434,6 +434,16 @@ class ResultTensorTA final : public Result {
     auto& t = get<ArrayT>();
     auto const& o = other.get<ArrayT>();
 
+    // A screened contraction can return a default (uninitialized) DistArray.
+    // Treat it as the additive identity.  In particular, do this before
+    // constructing a dummy annotation: TiledArray has no valid annotation for
+    // the rank-zero trange of a default DistArray.
+    if (!o.is_initialized() || o.trange().rank() == 0) return;
+    if (!t.is_initialized() || t.trange().rank() == 0) {
+      t = o;
+      return;
+    }
+
     SEQUANT_ASSERT(t.trange() == o.trange());
     auto ann = TA::detail::dummy_annotation(t.trange().rank());
 
@@ -682,6 +692,14 @@ class ResultTensorOfTensorTA final : public Result {
 
     auto& t = get<ArrayT>();
     auto const& o = other.get<ArrayT>();
+
+    // A screened contraction can return a default (uninitialized) DistArray.
+    // Treat it as the additive identity before inspecting outer/inner ranks.
+    if (!o.is_initialized() || o.trange().rank() == 0) return;
+    if (!t.is_initialized() || t.trange().rank() == 0) {
+      t = o;
+      return;
+    }
 
     SEQUANT_ASSERT(t.trange() == o.trange());
     // ToT annotation needs an inner block ("outer;inner"); tot_inner_rank()

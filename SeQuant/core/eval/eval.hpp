@@ -617,6 +617,33 @@ ResultPtr evaluate(Node const& node,  //
 
   // logging
   if constexpr (detail::trace(EvalTrace)) {
+    // At the highest trace level emit a machine-readable description of each
+    // tensor contraction.  Unlike the human-oriented Eval label, these are
+    // complete ResultExpr serializations: each operand can therefore be
+    // reconstructed and evaluated independently by MPQC's selected-expression
+    // pass.  This is deliberately outside the timed region.
+    if (Logger::instance().eval.level >= 4 && !node.leaf() &&
+        node->is_product() && node->is_tensor() &&
+        node.left()->is_tensor() && node.right()->is_tensor()) {
+      auto serialize_result = [](auto const& n) {
+        return toUtf8(io::serialization::to_string(
+            ResultExpr{n->as_tensor(), to_expr(n)}));
+      };
+      log::log("ProductBench",                                  //
+               std::format("left_tot={}", node.left()->tot()),  //
+               std::format("right_tot={}", node.right()->tot()),
+               std::format("result_tot={}", node->tot()),
+               std::format("denest={}", node.left()->tot() &&
+                                                node.right()->tot() &&
+                                                !node->tot()),
+               std::format("left_label={}", node.left()->label()),
+               std::format("right_label={}", node.right()->label()),
+               std::format("result_label={}", node->label()),
+               std::format("left={}", serialize_result(node.left())),
+               std::format("right={}", serialize_result(node.right())),
+               std::format("result={}", serialize_result(node)));
+    }
+
     // result->checksum() walks every stored element — real cost, unlike the
     // O(1) bytes()/size_in_bytes() metadata above — so only pay it when a
     // trace line will actually be emitted (log::printing() is the runtime

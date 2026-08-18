@@ -9,10 +9,14 @@ endmacro()
 function(target_warnings_as_errors TARGET)
     __check_gnu_like_compiler()
 
-    if (IS_GNU_LIKE_COMPILER)
+    # clang-21 is stricter than the fork's target gcc (extra -W diagnostics),
+    # so gate -Werror to GCC only for the clang-21 build used to regenerate
+    # the residual (build-compat; no effect on generated output, which is
+    # checksum-validated downstream).
+    if (IS_GNU_LIKE_COMPILER AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
         target_compile_options("${TARGET}" PRIVATE "-Werror")
     else()
-        message(DEBUG "Warnings-as-errors not supported for compiler '${CMAKE_CXX_COMPILER_ID}' - disabling…")
+        message(DEBUG "Warnings-as-errors disabled for compiler '${CMAKE_CXX_COMPILER_ID}'")
     endif()
 endfunction()
 

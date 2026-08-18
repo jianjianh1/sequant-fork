@@ -7,8 +7,8 @@
 //   e = csv_transform(e, pao_uocc, "C")
 //   if (seq_opt_): flatten(e); e = optimize(e, opts)
 //
-// Phase 0/1 of twinkly-dazzling-shamir.md: confirm this reproduces the
-// "only C/t carry proto_indices" invariant, then feed the result into
+// Confirm this reproduces the "only C/t carry proto_indices" invariant,
+// then feed the result into
 // TiledArrayGenerator.
 #include <SeQuant/core/context.hpp>
 #include <SeQuant/core/export/contraction_ir_generator.hpp>
@@ -470,8 +470,8 @@ int main() {
     // (single_term.hpp flops_counter) has NO per-outer-cell/per-block task-
     // overhead term, so it prices the (μ̃,Κ)-both-outer DF half-transform
     // intermediate I_ap2_μ̃_Κ[i,i,μ̃,Κ;a] -- millions of tiny per-pair PNO cells
-    // -- as cheap dense flops (it runs ~100x off peak at runtime; see
-    // sequant-ta-repro docs/MPQC_EVALUATION.md §8). Hypothesis: OptFor::Memsize,
+    // -- as cheap dense flops (it runs far below peak at runtime).
+    // Hypothesis: OptFor::Memsize,
     // which penalizes the ~7e7-element intermediate, would pick an order that
     // never holds aux(Κ) and PAO(μ̃) open at once.
     // RESULT (measured, R2): it does the OPPOSITE -- Memsize emits MORE such
@@ -784,8 +784,7 @@ int main() {
     }
 
     // --- Per-summand export (term-by-term numeric cross-check) ----------
-    // Phase 5 tier-3 comparison methodology (twinkly-dazzling-shamir.md):
-    // export EACH top-level summand of the post-optimize Sum as its own
+    // Export EACH top-level summand of the post-optimize Sum as its own
     // small named function so its checksum can be computed independently
     // and matched against the corresponding real MPQC trace row, instead
     // of only comparing the whole-residual sum.

@@ -80,8 +80,8 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
   TiledArrayGenerator() = default;
   ~TiledArrayGenerator() override = default;
 
-  /// Phase 4 (twinkly-dazzling-shamir.md): one entry per distinct terminal
-  /// (Usage::Terminal, i.e. function-parameter) leaf tensor encountered
+  /// One entry per distinct terminal (Usage::Terminal, i.e.
+  /// function-parameter) leaf tensor encountered
   /// during export, recorded in first-declared order. Lets a caller hand-map
   /// each generated parameter to the right TATensors field (same (label,
   /// family-signature) keying convention as gen_ta_trace_equations.py's
@@ -315,8 +315,7 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
     if (tensor.label().rfind(L"CSE", 0) == 0) return;
     const std::string type = tensor_cpp_type(tensor);
     m_body += m_indent + name + " = " + type + "();  // release\n";
-    // BUG FIX (2026-07-19, Phase 5 real-data crash investigation,
-    // twinkly-dazzling-shamir.md task #21): a released C++ variable slot
+    // A released C++ variable slot
     // can be REUSED for a later, semantically unrelated intermediate (same
     // name, fresh default-constructed value) -- but m_written (which
     // decides "=" vs "+=" in compute()) is scoped to the whole export, not
@@ -512,15 +511,14 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
     return false;
   }
 
-  // CANONICALIZATION (2026-07-19, Phase 5 real-data crash investigation,
-  // twinkly-dazzling-shamir.md task #21): a single-pass classification that
+  // A single-pass classification that
   // appends to `outer` in tensor.const_indices() ORDER produces a
   // DIFFERENT outer-axis order depending on where in that argument list a
   // proto-indexed index happens to sit -- e.g. a rank-1-proto "C" tensor
   // written as C^{a}_{i,\mu} (proto-carrying index first) classifies as
   // outer=[i,mu], but the SAME logical leaf written as C_{\mu}^{a}_{i} in
   // a different equation term (proto-carrying index last) classifies as
-  // outer=[mu,i] -- REVERSED. Both occurrences get bound, by Phase 4's
+  // outer=[mu,i] -- REVERSED. Both occurrences get bound by the
   // adapter, to the SAME physical array (loaded once with one fixed axis
   // order) -- confirmed empirically to be exactly what caused BOTH the T1
   // and T2 real-ethane-data crashes ("the contracted/fused dimensions...
@@ -762,8 +760,7 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
       return token_survives(result_inner_part, idx);
     };
 
-    // RESOLVED (2026-07-18/19, Phase 3 ground-truth testing +
-    // twinkly-dazzling-shamir.md task #19/#20): a plain (non-DeNest)
+    // A plain (non-DeNest)
     // TA::einsum(flat_operand, ToT_operand, ann) call -- what product_rhs
     // emits whenever only ONE operand is ToT -- used to segfault inside
     // TiledArray::Einsum::einsum<DeNest::False> whenever a shared OUTER
@@ -890,17 +887,14 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
       // (PNO/CSV) tile type are therefore unverified in practice, so
       // rather than guess (and risk silently emitting a call that either
       // fails to compile or -- worse -- compiles but contracts the inner
-      // dimension incorrectly), refuse to emit it here. Phase 3's
-      // from-scratch numpy ground truth + small compiled probes are where
-      // the correct ToT full-contraction call pattern gets pinned down
-      // and this is upgraded from a throw to real code.
+      // dimension incorrectly), refuse to emit it here until the correct
+      // ToT full-contraction call pattern is validated.
       if (is_tot_tensor(*tensors[0]) || is_tot_tensor(*tensors[1])) {
         throw Exception(
             "TiledArrayGenerator: fully-contracted (scalar-result) product "
             "of ToT (PNO/CSV-restricted) tensors is not yet supported -- "
             "TA::dot's semantics for nested (ArrayToT) tiles are unverified "
-            "(MPQC's own cck.ipp never calls it on ArrayToT); see Phase 3 "
-            "of twinkly-dazzling-shamir.md");
+            "(MPQC's own cck.ipp never calls it on ArrayToT)");
       }
       tensor_expr =
           "TA::dot(" + annotated(*tensors[0], ctx) + ", " +
@@ -914,7 +908,7 @@ class TiledArrayGenerator : public Generator<TiledArrayGeneratorContext> {
         throw Exception(
             "TiledArrayGenerator: fully-contracted (scalar-result) "
             "reduction of a single ToT (PNO/CSV-restricted) tensor is not "
-            "yet supported -- see Phase 3 of twinkly-dazzling-shamir.md");
+            "yet supported");
       }
       tensor_expr = annotated(*tensors[0], ctx) + ".sum()";
     } else if (tensors.empty()) {

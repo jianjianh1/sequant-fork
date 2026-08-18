@@ -411,6 +411,35 @@ bool equal_tarrays(Array const& arr1, Array const& arr2) {
 
 }  // namespace
 
+// A fully screened flat contraction is represented by a default DistArray.
+// It must behave as additive zero without asking TiledArray to construct an
+// annotation for the default array's rank-zero trange.
+TEST_CASE("flat_uninitialized_additive_identity", "[eval][ta]") {
+  using sequant::eval_result;
+  using sequant::ResultTensorTA;
+  using ResultFlat = ResultTensorTA<TA::TArrayD>;
+
+  TA::TArrayD empty1;
+  TA::TArrayD empty2;
+  auto r1 = eval_result<ResultFlat>(empty1);
+  auto r2 = eval_result<ResultFlat>(empty2);
+  REQUIRE_NOTHROW(r1->add_inplace(*r2));
+  REQUIRE_FALSE(r1->get<TA::TArrayD>().is_initialized());
+
+  auto& world = TA::get_default_world();
+  TA::TArrayD full{world, TA::TiledRange{{0, 2}}};
+  full.fill(1.0);
+  world.gop.fence();
+  auto r_full = eval_result<ResultFlat>(full);
+  REQUIRE_NOTHROW(r1->add_inplace(*r_full));
+  REQUIRE(r1->get<TA::TArrayD>().is_initialized());
+
+  TA::TArrayD empty3;
+  auto r3 = eval_result<ResultFlat>(empty3);
+  REQUIRE_NOTHROW(r1->add_inplace(*r3));
+  REQUIRE(r1->get<TA::TArrayD>().is_initialized());
+}
+
 // Regression tests for tensor-of-tensor (ToT) ops on arrays whose inner tiles
 // are all empty (e.g. a fully screened CSV residual). tot_inner_rank() reads
 // the rank from a populated inner tile, so it returns 0 here; downstream ToT
